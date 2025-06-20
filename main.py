@@ -5,9 +5,8 @@ import pinecone
 from dotenv import load_dotenv
 import os
 import uvicorn
-from pinecone_connection import PineconeCon
-from chatbot import get_bot, message_bot, message_bot_stream
-from doc_processor import DocProcessor
+from agent_processor import AgentProcessor
+from agent_chatbot import get_bot, message_bot, message_bot_structured, message_bot_stream
 from firebase_connection import FirebaseConnection
 from celery_app import test_task, celery
 from tasks import process_document
@@ -22,7 +21,6 @@ load_dotenv()
 # Constants
 API_VERSION = "1.0.0"
 DEFAULT_DIMENSION = 1536
-DEFAULT_NUM_RESULTS = 3
 STREAM_DELAY = 0.01
 
 # Initialize environment variables
@@ -36,8 +34,8 @@ if not openai_api_key:
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Uni Chatbot API",
-    description="API for university document processing and chatbot interactions",
+    title="Uni Chatbot API - Agent Edition",
+    description="API for university document processing and chatbot interactions using CrewAI agents",
     version=API_VERSION
 )
 
@@ -52,33 +50,26 @@ app.add_middleware(
 
 # Initialize connections
 pc = pinecone.Pinecone(api_key=pinecone_api_key)
-con = PineconeCon("userfiles")
-doc_processor = DocProcessor(pinecone_api_key, openai_api_key)
-
-# Initialize OpenAI Agent
-university_agent = UniversityAgent()
-
+agent_processor = AgentProcessor(pinecone_api_key, openai_api_key)
 
 class ChatState:
     """
-    Manages the state of the chatbot conversation.
+    Manages the state of the chatbot conversation using AgentChatbot.
     
     Stores the conversation chain and chat history for maintaining
     context across multiple interactions.
     """
     
     def __init__(self):
-        self.chain = None
-        self.chat_history = []
+        self.agent_chatbot = None
+        self.chat_history = {}  # Chat history per namespace
     
     def reset(self):
         """Reset the chat state to initial values."""
-        self.chain = None
-        self.chat_history = []
-
+        self.agent_chatbot = None
+        self.chat_history = {}
 
 chat_state = ChatState()
-
 
 @app.get("/")
 async def root():
@@ -89,21 +80,22 @@ async def root():
         Dict containing welcome message, status, and version information
     """
     return {
-        "message": "Welcome to the Uni Chatbot API", 
+        "message": "Welcome to the Uni Chatbot API - Agent Edition", 
         "status": "online", 
-        "version": API_VERSION
+        "version": API_VERSION,
+        "features": ["CrewAI Agents", "Agentic RAG", "PDFPlumber", "Streaming Responses", "Structured Outputs"]
     }
-
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...)):
     """
-    Upload and process a PDF document asynchronously.
+    Upload and process a PDF document asynchronously using AgentProcessor.
     
     Args:
         file: PDF file to upload and process
         namespace: Namespace for organizing documents  
         fileID: Unique identifier for the document
+        additionalInfo: Additional information (currently unused)
         
     Returns:
         Dict containing upload status and task information
@@ -114,7 +106,6 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
                 "status": "error",
                 "message": "Only PDF files are supported",
                 "filename": file.filename
-                
             }
             
         content = await file.read()
@@ -122,7 +113,7 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         
         return {
             "status": "success",
-            "message": "File upload started",
+            "message": "File upload started - will be processed with CrewAI agents",
             "task_id": task.id,
             "filename": file.filename
         }
@@ -133,12 +124,11 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
             "filename": file.filename
         }
 
-
 @app.post("/delete")
 async def delete_file(file_name: str = Form(...), namespace: str = Form(...), 
                      fileID: str = Form(...), just_firebase: str = Form(...)):
     """
-    Delete a document from Pinecone and/or Firebase.
+    Delete a document from Pinecone and/or Firebase using AgentProcessor.
     
     Args:
         file_name: Name of the file to delete
@@ -150,32 +140,21 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
         Dict containing deletion status from both services
     """
     try:
-        firebase = FirebaseConnection()
-        
         if just_firebase.lower() == "true":
-            # Delete only Pinecone embeddings
-            pinecone_result = con.delete_embeddings(file_name, namespace)
-            firebase_result = firebase.delete_document_metadata(namespace, fileID)
-            
+            # Delete using AgentProcessor
+            result = agent_processor.delete_document(namespace, fileID)
             return {
-                "status": "success", 
-                "message": f"File {file_name} deleted successfully",
-                "pinecone_status": pinecone_result.get("status", "unknown"),
-                "firebase_status": firebase_result["status"],
-                "firebase_message": firebase_result["message"]
+                "status": result["status"], 
+                "message": result["message"],
+                "agent_processor_status": result["status"]
             }
         else:
-            # Delete from both services
-            firebase_result = firebase.delete_document_metadata(namespace, fileID)
-            pinecone_result = con.delete_embeddings(file_name, namespace)
-
+            # Delete using AgentProcessor (handles both Pinecone and Firebase)
+            result = agent_processor.delete_document(namespace, fileID)
             return {
-                "status": "success", 
-                "message": f"File {file_name} deleted successfully",
-                "pinecone_status": pinecone_result.get("status", "unknown"),
-                "pinecone_message": pinecone_result.get("message", ""),
-                "firebase_status": firebase_result["status"],
-                "firebase_message": firebase_result["message"]
+                "status": result["status"], 
+                "message": result["message"],
+                "agent_processor_status": result["status"]
             }
     except Exception as e:
         return {
@@ -183,78 +162,154 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
             "message": f"Error deleting file: {str(e)}"
         }
 
-
 @app.post("/start_bot")
 async def start_bot():
     """
-    Initialize the chatbot and reset conversation state.
+    Initialize the AgentChatbot and reset conversation state.
     
     Returns:
         Dict containing initialization status
     """
     try:
-        chat_state.chain = get_bot()
-        chat_state.chat_history = []
-        return {
-            "status": "success", 
-            "message": "Bot started successfully"
-        }
+        chat_state.agent_chatbot = get_bot()
+        result = chat_state.agent_chatbot.start_bot()
+        chat_state.chat_history = {}
+        return result
     except Exception as e:
         return {
-            "status": "error",
-            "message": f"Error starting bot: {str(e)}"
+            "status": "error", 
+            "message": f"Error starting agent bot: {str(e)}"
         }
 
-def _get_relevant_context(user_input: str, namespace: str, history: list) -> tuple:
+@app.post("/send_message")
+async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
     """
-    Get relevant context for a user query from document database.
+    Send a message to the CrewAI agent and get a complete response.
     
     Args:
-        user_input: User's question or message
-        namespace: Namespace to search within
+        user_input: User's question or message  
+        namespace: Namespace to search for relevant documents
         
     Returns:
-        Tuple containing (context_text, database_overview, document_id) or error info
+        Dict containing the agent's response and metadata
     """
-    # Get namespace overview
-    database_overview = doc_processor.get_namespace_data(namespace)
-    # if not database_overview:
-    #    return None, None, None, f"No documents found in namespace {namespace}"
+    if not chat_state.agent_chatbot:
+        return {
+            "status": "error",
+            "message": "Agent bot not started. Please call /start_bot first",
+            "response": ""
+        }
+    
+    try:
+        # Get or initialize chat history for this namespace
+        if namespace not in chat_state.chat_history:
+            chat_state.chat_history[namespace] = []
         
-    # Find appropriate document
-    appropriate_document = doc_processor.appropriate_document_search(
-        namespace=namespace, extracted_data=database_overview, user_query=user_input, history=history,
-    )
-    
-    if not appropriate_document or "id" not in appropriate_document:
-        return None, None, None, "Could not find appropriate document for query"
-
-    # Query vector database
-    results = con.query(
-        query=user_input, 
-        namespace=namespace, 
-        fileID=appropriate_document["id"], 
-        num_results=DEFAULT_NUM_RESULTS
-    )
-    
-    # Extract context from results
-    context_parts = []
-    for match in results.matches:
-        if hasattr(match, 'metadata') and 'text' in match.metadata:
-            context_parts.append(match.metadata['text'])
-    
-    if not context_parts:
-        return None, None, None, "No relevant content found for query"
+        history = chat_state.chat_history[namespace]
         
-    context = "\n".join(context_parts)
-    return context, database_overview, appropriate_document["id"], None
+        # Use the message_bot function to get complete response
+        response = message_bot(
+            user_input, "", "", None, 
+            "", history, namespace
+        )
+        
+        # Update chat history
+        chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
+        chat_state.chat_history[namespace].append({"role": "assistant", "content": response})
+        
+        # Keep only last 20 messages to prevent memory overflow
+        if len(chat_state.chat_history[namespace]) > 20:
+            chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
+        
+        return {
+            "status": "success",
+            "message": "Response generated successfully",
+            "response": response,
+            "namespace": namespace,
+            "user_input": user_input
+        }
+        
+    except Exception as e:
+        print(f"Error in send_message: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error processing message: {str(e)}",
+            "response": ""
+        }
 
-
+@app.post("/send_message_structured")
+async def send_message_structured(user_input: str = Form(...), namespace: str = Form(...)):
+    """
+    Send a message to the CrewAI agent and get a structured response with metadata.
+    
+    Args:
+        user_input: User's question or message  
+        namespace: Namespace to search for relevant documents
+        
+    Returns:
+        Dict containing structured response with answer, sources, confidence, etc.
+    """
+    if not chat_state.agent_chatbot:
+        return {
+            "status": "error",
+            "message": "Agent bot not started. Please call /start_bot first",
+            "structured_response": {
+                "answer": "Bot nicht gestartet",
+                "document_ids": [],
+                "sources": [],
+                "confidence_score": 0.0,
+                "context_used": False,
+                "additional_info": "Bot muss zuerst gestartet werden"
+            }
+        }
+    
+    try:
+        # Get or initialize chat history for this namespace
+        if namespace not in chat_state.chat_history:
+            chat_state.chat_history[namespace] = []
+        
+        history = chat_state.chat_history[namespace]
+        
+        # Use the structured message_bot function
+        structured_response = message_bot_structured(
+            user_input, namespace, history
+        )
+        
+        # Update chat history
+        chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
+        chat_state.chat_history[namespace].append({"role": "assistant", "content": structured_response["answer"]})
+        
+        # Keep only last 20 messages to prevent memory overflow
+        if len(chat_state.chat_history[namespace]) > 20:
+            chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
+        
+        return {
+            "status": "success",
+            "message": "Structured response generated successfully",
+            "namespace": namespace,
+            "user_input": user_input,
+            "structured_response": structured_response
+        }
+        
+    except Exception as e:
+        print(f"Error in send_message_structured: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error processing message: {str(e)}",
+            "structured_response": {
+                "answer": f"Fehler: {str(e)}",
+                "document_ids": [],
+                "sources": [],
+                "confidence_score": 0.0,
+                "context_used": False,
+                "additional_info": f"Exception: {type(e).__name__}"
+            }
+        }
 
 @app.post("/create_namespace")
 async def create_namespace(namespace: str = Form(...), dimension: int = Form(DEFAULT_DIMENSION)):
     """
-    Create a new namespace in the Pinecone index.
+    Create a new namespace in the Pinecone index using AgentProcessor.
     
     Args:
         namespace: Name of the namespace to create
@@ -264,16 +319,18 @@ async def create_namespace(namespace: str = Form(...), dimension: int = Form(DEF
         Dict containing creation status
     """
     try:
-        pc = PineconeCon("userfiles")
-        result = pc.create_namespace_with_dummy(namespace, dimension)
-        return result
-        
+        # Setup vectorstore for namespace (this creates it if it doesn't exist)
+        vectorstore = agent_processor.setup_vectorstore(namespace)
+        return {
+            "status": "success",
+            "message": f"Namespace {namespace} created/initialized successfully",
+            "dimension": dimension
+        }
     except Exception as e:
         return {
             "status": "error", 
             "message": f"Error creating namespace: {str(e)}"
         }
-
 
 @app.post("/delete_namespace")
 async def delete_namespace(namespace: str = Form(...)):
@@ -287,17 +344,19 @@ async def delete_namespace(namespace: str = Form(...)):
         Dict containing deletion status from both services
     """
     try:
-        pc = PineconeCon("userfiles")
-        pinecone_result = pc.delete_namespace(namespace)
+        # Delete all documents in namespace using Pinecone client
+        index = agent_processor._pc.Index(agent_processor._index_name)
+        index.delete(namespace=namespace, delete_all=True)
         
-        firebase = FirebaseConnection()
-        firebase_result = firebase.delete_namespace_metadata(namespace)
+        # Delete Firebase metadata if available
+        firebase_result = {"status": "success", "message": "Firebase not available"}
+        if agent_processor._firebase_available:
+            firebase_result = agent_processor._firebase.delete_namespace_metadata(namespace)
         
         return {
             "status": "success", 
             "message": f"Namespace {namespace} deleted successfully",
-            "pinecone_status": pinecone_result.get("status", "unknown"),
-            "pinecone_message": pinecone_result.get("message", ""),
+            "pinecone_status": "success",
             "firebase_status": firebase_result["status"],
             "firebase_message": firebase_result["message"]
         }
@@ -306,7 +365,6 @@ async def delete_namespace(namespace: str = Form(...)):
             "status": "error", 
             "message": f"Error deleting namespace: {str(e)}"
         }
-
 
 @app.get("/test_worker")
 async def test_worker():
@@ -328,7 +386,6 @@ async def test_worker():
             "status": "error",
             "message": f"Error testing worker: {str(e)}"
         }
-
 
 def _handle_task_state(task) -> dict:
     """
@@ -352,7 +409,7 @@ def _handle_task_state(task) -> dict:
         return {
             'state': task.state,
             'status': 'PROCESSING',
-            'message': meta.get('status', 'Processing'),
+            'message': meta.get('status', 'Processing with agents'),
             'current': meta.get('current', 0),
             'total': meta.get('total', 100),
             'progress': meta.get('current', 0),
@@ -396,7 +453,7 @@ def _handle_task_state(task) -> dict:
                 'result': {
                     'message': 'No result data available',
                     'chunks': 0,
-                    'pinecone_status': 'unknown',
+                    'agent_status': 'unknown',
                     'firebase_status': 'unknown',
                     'file': ''
                 }
@@ -405,7 +462,7 @@ def _handle_task_state(task) -> dict:
             return {
                 'state': task.state,
                 'status': 'SUCCESS',
-                'message': 'Completed successfully',
+                'message': 'Completed successfully - Agent ready',
                 'progress': 100,
                 'result': {
                     'message': result.get('message', 'Task completed'),
@@ -424,7 +481,6 @@ def _handle_task_state(task) -> dict:
             'progress': 0
         }
 
-
 @app.get("/task_status/{task_id}")
 async def get_task_status(task_id: str):
     """
@@ -441,19 +497,19 @@ async def get_task_status(task_id: str):
     """
     try:
         task = celery.AsyncResult(task_id)
-        print(f"Task state: {task.state}")
-        print(f"Task info: {task.info}")
-        print(f"Task result: {task.result}")
+        print(f"Agent Task state: {task.state}")
+        print(f"Agent Task info: {task.info}")
+        print(f"Agent Task result: {task.result}")
         
         response = _handle_task_state(task)
-        print(f"Sending response: {response}")
+        print(f"Sending agent response: {response}")
         return response
         
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"Error in task status: {str(e)}")
+        print(f"Error in agent task status: {str(e)}")
         error_detail = {
             'state': 'ERROR',
             'status': 'ERROR',
@@ -467,7 +523,6 @@ async def get_task_status(task_id: str):
         }
         raise HTTPException(status_code=500, detail=error_detail)
 
-
 async def _stream_error_response(message: str):
     """
     Generate error response for streaming endpoints.
@@ -480,13 +535,12 @@ async def _stream_error_response(message: str):
     """
     yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
 
-
 @app.post("/send_message_stream")
 async def send_message_stream(user_input: str = Form(...), namespace: str = Form(...)):
     """
-    Streaming version of send_message with real-time AI response chunks.
+    Streaming version of send_message with real-time AI response chunks using CrewAI agents.
     
-    Sends Server-Sent Events with incremental response chunks as the AI
+    Sends Server-Sent Events with incremental response chunks as the AI agent
     generates the response, providing real-time feedback to the user.
     
     Args:
@@ -496,9 +550,9 @@ async def send_message_stream(user_input: str = Form(...), namespace: str = Form
     Returns:
         StreamingResponse with Server-Sent Events
     """
-    if not chat_state.chain:
+    if not chat_state.agent_chatbot:
         return StreamingResponse(
-            _stream_error_response("Bot not started. Please call /start_bot first"),
+            _stream_error_response("Agent bot not started. Please call /start_bot first"),
             media_type="text/plain",
             headers={
                 "Cache-Control": "no-cache",
@@ -514,20 +568,18 @@ async def send_message_stream(user_input: str = Form(...), namespace: str = Form
             yield f"data: {json.dumps({'type': 'chunk', 'content': ''})}\n\n"
             await asyncio.sleep(0.1)
             
-            # Get context and document information
-            history = chat_state.chat_history
-            context, database_overview, document_id, error = _get_relevant_context(user_input, namespace, history)
+            # Get or initialize chat history for this namespace
+            if namespace not in chat_state.chat_history:
+                chat_state.chat_history[namespace] = []
             
-            if error:
-                yield f"data: {json.dumps({'type': 'error', 'message': error})}\n\n"
-                return 
+            history = chat_state.chat_history[namespace]
             
-            # Stream the AI response in real-time
+            # Stream the AI agent response in real-time
             accumulated_response = ""
             
             for chunk in message_bot_stream(
-                user_input, context, "", database_overview, 
-                document_id, history
+                user_input, "", "", None, 
+                "", history, namespace
             ):
                 accumulated_response += chunk
                 
@@ -536,8 +588,12 @@ async def send_message_stream(user_input: str = Form(...), namespace: str = Form
                 await asyncio.sleep(STREAM_DELAY)  # Prevent overwhelming the client
             
             # Update chat history after streaming is complete
-            chat_state.chat_history.append({"role": "user", "content": user_input})
-            chat_state.chat_history.append({"role": "assistant", "content": accumulated_response})
+            chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
+            chat_state.chat_history[namespace].append({"role": "assistant", "content": accumulated_response})
+            
+            # Keep only last 20 messages to prevent memory overflow
+            if len(chat_state.chat_history[namespace]) > 20:
+                chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
             
             # Send completion event
             yield f"data: {json.dumps({'type': 'complete', 'fullResponse': accumulated_response})}\n\n"
@@ -556,6 +612,29 @@ async def send_message_stream(user_input: str = Form(...), namespace: str = Form
             "Access-Control-Allow-Headers": "*",
         }
     )
+
+@app.get("/namespace_info/{namespace}")
+async def get_namespace_info(namespace: str):
+    """
+    Get information about documents in a namespace using AgentProcessor.
+    
+    Args:
+        namespace: Namespace identifier
+        
+    Returns:
+        Dict containing namespace information
+    """
+    try:
+        if not chat_state.agent_chatbot:
+            chat_state.agent_chatbot = get_bot()
+        
+        result = chat_state.agent_chatbot.get_namespace_info(namespace)
+        return result
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error getting namespace info: {str(e)}"
+        }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
