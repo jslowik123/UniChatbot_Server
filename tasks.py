@@ -1,87 +1,194 @@
-import os
-import logging
 from celery_app import celery
+import time
+from redis import Redis
+import os
 from agent_processor import AgentProcessor
+from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
-@celery.task(bind=True)
-def process_file_async(self, file_path: str, filename: str, namespace: str, task_id: str):
-    """Process a PDF file asynchronously using the AgentProcessor"""
+# Initialize Redis and AgentProcessor
+r = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+agent_processor = AgentProcessor(
+    pinecone_api_key=os.getenv("PINECONE_API_KEY"),
+    openai_api_key=os.getenv("OPENAI_API_KEY")
+)
+
+
+@celery.task(bind=True, name="tasks.process_document")
+def process_document(self, file_content: bytes, namespace: str, fileID: str, filename: str):
+    """
+    Process a document asynchronously using Celery with AgentProcessor.
+    
+    Handles PDF parsing, text extraction, embedding generation, and storage
+    in both Pinecone and Firebase with progress tracking using the new
+    CrewAI-based agent architecture.
+    
+    Args:
+        self: Celery task instance (bound task)
+        file_content: Raw PDF file content as bytes
+        namespace: Pinecone namespace for organization
+        fileID: Unique document identifier
+        filename: Original filename
+        
+    Returns:
+        Dict containing processing results and status
+        
+    Raises:
+        Exception: If processing fails at any stage
+    """
     try:
-        # Initialize agent processor
-        agent_processor = AgentProcessor()
+        # Update initial status
+        if agent_processor._firebase_available:
+            agent_processor._firebase.update_document_status(namespace, fileID, {
+                'processing': True,
+                'progress': 0,
+                'status': 'Starting document processing'
+            })
         
-        # Update task state
         self.update_state(
-            state='PROCESSING',
+            state='STARTED',
             meta={
-                'status': f'Processing file: {filename}',
-                'current': 10,
+                'status': 'Starting document processing',
+                'current': 0,
                 'total': 100,
                 'file': filename
             }
         )
         
-        # Process the document
-        result = agent_processor.process_document(file_path, filename, namespace)
+        # Update status: Reading document
+        if agent_processor._firebase_available:
+            agent_processor._firebase.update_document_status(namespace, fileID, {
+                'progress': 25,
+                'status': 'Reading document with pdfplumber'
+            })
         
-        # Update task state
         self.update_state(
             state='PROCESSING',
             meta={
-                'status': 'Document processed, finalizing...',
-                'current': 90,
+                'status': 'Reading document with pdfplumber',
+                'current': 25,
                 'total': 100,
                 'file': filename
             }
         )
         
-        # Clean up temporary file
-        if os.path.exists(file_path):
-            os.unlink(file_path)
+        # Update status: Processing chunks and embeddings
+        if agent_processor._firebase_available:
+            agent_processor._firebase.update_document_status(namespace, fileID, {
+                'progress': 50,
+                'status': 'Creating chunks and embeddings'
+            })
         
-        # Final state
-        return {
-            'status': 'success',
-            'message': f'Document {filename} processed successfully',
-            'document_id': result['document_id'],
-            'chunks_created': result['chunks_created'],
-            'file': filename,
-            'namespace': namespace
-        }
+        self.update_state(
+            state='PROCESSING',
+            meta={
+                'status': 'Creating chunks and embeddings',
+                'current': 50,
+                'total': 100,
+                'file': filename
+            }
+        )
         
+        # Process the document using the new AgentProcessor
+        result = agent_processor.process_document_full(file_content, namespace, fileID, filename)
+        
+        # Update status: Finalizing processing
+        if agent_processor._firebase_available:
+            agent_processor._firebase.update_document_status(namespace, fileID, {
+                'progress': 75,
+                'status': 'Finalizing processing and setting up agent'
+            })
+        
+        self.update_state(
+            state='PROCESSING',
+            meta={
+                'status': 'Finalizing processing and setting up agent',
+                'current': 75,
+                'total': 100,
+                'file': filename
+            }
+        )
+        
+        if result['status'] == 'success':
+            # Update final status
+            if agent_processor._firebase_available:
+                agent_processor._firebase.update_document_status(namespace, fileID, {
+                    'processing': False,
+                    'progress': 100,
+                    'status': 'Complete - Agent ready'
+                })
+            
+            # Trigger the global summary generation task
+            generate_namespace_summary.delay(namespace)
+            
+            return {
+                'status': 'success',
+                'message': result['message'],
+                'chunks': result.get('chunks', 0),
+                'pinecone_result': result.get('pinecone_result', {}),
+                'firebase_result': result.get('firebase_result', {}),
+                'file': filename,
+                'current': 100,
+                'total': 100
+            }
+        else:
+            # Handle processing failure
+            if agent_processor._firebase_available:
+                agent_processor._firebase.update_document_status(namespace, fileID, {
+                    'processing': False,
+                    'progress': 0,
+                    'status': f"Processing failed: {result['message']}"
+                })
+            raise Exception(f"Processing failed: {result['message']}")
+            
     except Exception as e:
-        logger.error(f"Error processing file {filename}: {str(e)}")
+        # Update error status
+        if agent_processor._firebase_available:
+            agent_processor._firebase.update_document_status(namespace, fileID, {
+                'processing': False,
+                'progress': 0,
+                'status': f"Failed: {str(e)}"
+            })
         
-        # Clean up temporary file on error
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-        
-        # Update task state to failure
         self.update_state(
             state='FAILURE',
             meta={
-                'status': f'Failed to process {filename}',
-                'error': str(e),
-                'file': filename
+                'exc_type': type(e).__name__,
+                'exc_message': str(e),
+                'status': 'Failed',
+                'error': f"{type(e).__name__}: {str(e)}",
+                'file': filename,
+                'current': 0,
+                'total': 100
             }
         )
-        
-        # Re-raise the exception to mark task as failed
-        raise Exception(f"Failed to process {filename}: {str(e)}")
+        raise e
 
-# Backward compatibility function
-def process_document(file_content: bytes, namespace: str, fileID: str, filename: str):
-    """Legacy function for backward compatibility"""
-    import tempfile
+
+@celery.task(name="tasks.generate_namespace_summary")
+def generate_namespace_summary(namespace: str):
+    """
+    Generate and store a global summary for all documents in a namespace.
     
-    # Save content to temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-        temp_file.write(file_content)
-        temp_file_path = temp_file.name
+    This task is triggered after successful document processing to maintain
+    an up-to-date overview of all documents in the namespace.
     
-    # Process using the new function
-    return process_file_async.delay(temp_file_path, filename, namespace, fileID)
+    Args:
+        namespace: The namespace to generate a summary for
+        
+    Returns:
+        Dict containing operation status and results
+    """
+    try:
+        result = agent_processor.get_namespace_summary(namespace)
+        return {
+            'status': 'success',
+            'message': f"Global summary generated for namespace: {namespace}",
+            'summary_result': result
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': f"Failed to generate global summary: {str(e)}"
+        }
