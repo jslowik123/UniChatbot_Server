@@ -36,9 +36,25 @@ class FirebaseConnection:
         database_url = os.getenv('FIREBASE_DATABASE_URL')
         if not database_url:
             raise ValueError("FIREBASE_DATABASE_URL environment variable must be set")
-            
-        if not firebase_admin._apps:
-            self._initialize_firebase_app(database_url)
+        
+        # Always ensure we have a Firebase app initialized
+        try:
+            # Check if any app exists
+            if not firebase_admin._apps:
+                self._initialize_firebase_app(database_url)
+            else:
+                # Get the default app
+                app = firebase_admin.get_app()
+                print(f"Using existing Firebase app: {app.name}")
+        except ValueError as e:
+            # If no default app exists, try to get or create one
+            try:
+                app = firebase_admin.get_app()
+                print(f"Retrieved existing Firebase app: {app.name}")
+            except ValueError:
+                # No app exists, initialize new one
+                print("No Firebase app found, initializing new one...")
+                self._initialize_firebase_app(database_url)
         
         self._db = db
 
@@ -52,19 +68,54 @@ class FirebaseConnection:
         credentials_path = os.getenv('FIREBASE_CREDENTIALS_PATH')
         credentials_json = os.getenv('FIREBASE_CREDENTIALS_JSON')
         
-        if credentials_json:
-            try:
+        try:
+            if credentials_json:
                 # Initialize from JSON string
                 cred_dict = json.loads(credentials_json)
                 cred = credentials.Certificate(cred_dict)
                 firebase_admin.initialize_app(cred, {
                     'databaseURL': database_url
                 })
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON credentials: {str(e)}")
-                # Fallback to file credentials or no auth
-                self._fallback_initialization(database_url, credentials_path)
-    
+                print("Firebase initialized with JSON credentials")
+            elif credentials_path and os.path.exists(credentials_path):
+                # Initialize from file
+                cred = credentials.Certificate(credentials_path)
+                firebase_admin.initialize_app(cred, {
+                    'databaseURL': database_url
+                })
+                print("Firebase initialized with file credentials")
+            else:
+                # Emergency fallback without credentials (for development)
+                firebase_admin.initialize_app(options={
+                    'databaseURL': database_url
+                })
+                print("Firebase initialized without credentials (development mode)")
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON credentials: {str(e)}")
+            # Try file credentials as fallback
+            if credentials_path and os.path.exists(credentials_path):
+                cred = credentials.Certificate(credentials_path)
+                firebase_admin.initialize_app(cred, {
+                    'databaseURL': database_url
+                })
+                print("Firebase initialized with file credentials after JSON error")
+            else:
+                # Last resort fallback
+                firebase_admin.initialize_app(options={
+                    'databaseURL': database_url
+                })
+                print("Firebase initialized without credentials after JSON error")
+        except Exception as e:
+            print(f"Firebase initialization error: {str(e)}")
+            # Last resort - try basic initialization
+            try:
+                firebase_admin.initialize_app(options={
+                    'databaseURL': database_url
+                })
+                print("Firebase initialized with basic fallback")
+            except Exception as final_e:
+                print(f"Final Firebase initialization failed: {str(final_e)}")
+                raise ValueError(f"Could not initialize Firebase: {str(final_e)}")
 
     def _fallback_initialization(self, database_url: str, credentials_path: str = None):
         """
@@ -74,16 +125,8 @@ class FirebaseConnection:
             database_url: Firebase database URL
             credentials_path: Optional path to credentials file
         """
-        if credentials_path and os.path.exists(credentials_path):
-            cred = credentials.Certificate(credentials_path)
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': database_url
-            })
-        else:
-            # Emergency fallback without credentials
-            firebase_admin.initialize_app(options={
-                'databaseURL': database_url
-            })
+        # This method is now integrated into _initialize_firebase_app
+        pass
 
     def append_metadata(self, namespace: str, fileID: str, chunk_count: int, 
                        keywords: List[str], summary: str) -> Dict[str, Any]:
@@ -101,6 +144,13 @@ class FirebaseConnection:
             Dict containing operation status and information
         """
         try:
+            # Ensure Firebase app is available
+            if not firebase_admin._apps:
+                return {
+                    'status': 'error',
+                    'message': 'Firebase app not initialized'
+                }
+            
             # Database path for the document
             ref = self._db.reference(f'files/{namespace}/{fileID}')
             
@@ -313,6 +363,13 @@ class FirebaseConnection:
             Dict containing operation status
         """
         try:
+            # Ensure Firebase app is available
+            if not firebase_admin._apps:
+                return {
+                    'status': 'error',
+                    'message': 'Firebase app not initialized'
+                }
+            
             ref = self._db.reference(f'files/{namespace}/{fileID}')
             
             existing_data = ref.get() or {}

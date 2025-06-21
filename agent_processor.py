@@ -215,9 +215,9 @@ class AgentProcessor:
             # Prepare texts and metadata
             texts = processed_pdf["chunks"] + [processed_pdf["summary"]]
             metadatas = [
-                {"pdf_id": fileID, "type": "chunk", "chunk_id": i} 
+                {"pdf_id": fileID, "document_id": fileID, "type": "chunk", "chunk_id": i} 
                 for i in range(len(processed_pdf["chunks"]))
-            ] + [{"pdf_id": fileID, "type": "summary"}]
+            ] + [{"pdf_id": fileID, "document_id": fileID, "type": "summary"}]
             
             # Add texts to vectorstore
             vectorstore.add_texts(texts=texts, metadatas=metadatas)
@@ -263,30 +263,119 @@ class AgentProcessor:
         )
         
         # PDF Retriever Tool für CrewAI
-        @tool("PDF Search Tool")
-        def pdf_search_tool(query: str) -> str:
-            """Durchsucht PDF-Dokumente nach relevanten Informationen basierend auf der Suchanfrage."""
+        @tool("Document Overview Tool")
+        def document_overview_tool() -> str:
+            """Zeigt eine Übersicht aller verfügbaren Dokumente im aktuellen Namespace mit deren Zusammenfassungen und IDs."""
             try:
+                summary_data = self.get_namespace_summary(namespace)
+                print(summary_data)
+                if summary_data["status"] != "success":
+                    return f"FEHLER: {summary_data.get('message', 'Unbekannter Fehler beim Abrufen der Dokumentübersicht')}"
+                
+                if summary_data["document_count"] == 0:
+                    return "KEINE DOKUMENTE: In diesem Namespace sind aktuell keine Dokumente verfügbar."
+                
+                overview_parts = [
+                    f"📚 DOKUMENTÜBERSICHT ({summary_data['document_count']} Dokumente verfügbar):",
+                    "=" * 60
+                ]
+                
+                for doc in summary_data["documents"]:
+                    doc_info = [
+                        f"🔹 DOKUMENT-ID: {doc['id']}",
+                        f"   Name: {doc.get('name', doc['id'])}",
+                        f"   Status: {doc.get('status', 'Unknown')}",
+                        f"   Chunks: {doc.get('chunk_count', 0)}",
+                        f"   Datum: {doc.get('date', 'Unbekannt')}",
+                        f"   Zusammenfassung: {doc['summary'][:200]}{'...' if len(doc['summary']) > 200 else ''}",
+                    ]
+                    
+                    # Add additional_info if present
+                    if doc.get('additional_info'):
+                        doc_info.append(f"   Zusätzliche Info: {doc['additional_info']}")
+                    
+                    doc_info.append("")  # Empty line for separation
+                    overview_parts.extend(doc_info)
+                
+                overview_parts.append("💡 Verwende das 'PDF Search Tool' mit spezifischen Dokument-IDs für detaillierte Suchen!")
+                
+                return "\n".join(overview_parts)
+                
+            except Exception as e:
+                return f"FEHLER beim Abrufen der Dokumentübersicht: {str(e)}"
+
+        @tool("PDF Search Tool")
+        def pdf_search_tool(query: str, document_ids: str = "") -> str:
+            """Durchsucht PDF-Dokumente nach relevanten Informationen. 
+            
+            Args:
+                query: Die Suchanfrage
+                document_ids: Optional - Komma-getrennte Liste von Dokument-IDs um die Suche zu filtern (z.B. 'doc1,doc2')
+            """
+            try:
+                # Parse document IDs filter if provided
+                target_doc_ids = None
+                if document_ids.strip():
+                    target_doc_ids = [doc_id.strip() for doc_id in document_ids.split(',') if doc_id.strip()]
+                    print(f"🔍 Suche beschränkt auf Dokumente: {target_doc_ids}")
+                
                 docs = compression_retriever.get_relevant_documents(query)
+                
+                if not docs:
+                    return "KEINE DOKUMENTE GEFUNDEN: Es wurden keine relevanten Dokumente für diese Anfrage gefunden. Der Namespace könnte leer sein oder die Anfrage passt zu keinem verfügbaren Inhalt."
+                
+                # Filter by document IDs if specified
+                if target_doc_ids:
+                    filtered_docs = []
+                    for doc in docs:
+                        doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
+                        if doc_id in target_doc_ids:
+                            filtered_docs.append(doc)
+                    docs = filtered_docs
+                    
+                    if not docs:
+                        return f"KEINE DOKUMENTE IN GEFILTERTEN IDs: Es wurden keine relevanten Dokumente in den spezifizierten Dokument-IDs {target_doc_ids} gefunden."
+                
                 results = []
+                found_doc_ids = set()
                 for doc in docs:
                     # Extract metadata for structured response
-                    doc_id = doc.metadata.get('pdf_id', 'unknown')
+                    doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
+                    found_doc_ids.add(doc_id)
                     content = doc.page_content
                     results.append(f"[DOC_ID: {doc_id}] {content}")
-                return "\n\n".join(results)
+                
+                if not results:
+                    return "KEINE RELEVANTEN INHALTE: Dokumente wurden gefunden, aber sie enthalten keine relevanten Informationen für diese Anfrage."
+                
+                # Add document IDs info for the agent to use
+                doc_ids_list = list(found_doc_ids)
+                result_text = "\n\n".join(results)
+                result_text += f"\n\n[SYSTEM_INFO] FOUND_DOCUMENT_IDS: {doc_ids_list}"
+                
+                if target_doc_ids:
+                    result_text += f"\n[SYSTEM_INFO] FILTERED_BY_DOC_IDS: {target_doc_ids}"
+                
+                return result_text
+                
             except Exception as e:
-                return f"Fehler beim Durchsuchen der Dokumente: {str(e)}"
+                return f"FEHLER BEIM DURCHSUCHEN: {str(e)}"
         
         # Agent definieren
         researcher = Agent(
-            role="University Research Assistant",
-            goal="Beantworte Fragen mit PDF- und Universitätsdaten präzise und umfassend in strukturiertem Format",
-            backstory="""Du bist ein erfahrener universitärer Forschungsassistent, der PDF-Dokumente und universitäre 
-            Informationen nutzt, um präzise und umfassende Antworten zu geben. Du sprichst Deutsch und hilfst 
-            Studierenden bei ihren Fragen. Du gibst IMMER strukturierte Antworten im JSON-Format zurück.""",
+            role="Hilfsbereit Studienbuddy",
+            goal="Sei ein natürlicher, freundlicher Gesprächspartner für Studierende. Führe normale Unterhaltungen und nutze Dokumente nur wenn sie wirklich relevant sind.",
+            backstory="""Du bist ein entspannter, hilfsbereiter Studienbuddy der Deutsch spricht. Du kannst über alles reden - 
+            Studienfragen, alltägliche Dinge, Probleme oder einfach plaudern. Wenn jemand spezifische Fragen hat, die in 
+            den verfügbaren Dokumenten beantwortet werden können, dann suchst du gerne nach - aber das ist nicht dein 
+            Hauptfokus. Du bist erstmal ein normaler Gesprächspartner, der hilft wo er kann. Sei locker, freundlich und 
+            authentisch. Du musst nicht immer in Dokumenten suchen - manchmal reicht dein Allgemeinwissen völlig aus.
+            
+            Du hast zwei Tools zur Verfügung:
+            1. Document Overview Tool - um zu sehen welche Dokumente verfügbar sind
+            2. PDF Search Tool - um in spezifischen oder allen Dokumenten zu suchen""",
             llm=self._llm,
-            tools=[pdf_search_tool],
+            tools=[document_overview_tool, pdf_search_tool],
             verbose=True,
             allow_delegation=False
         )
@@ -324,49 +413,61 @@ class AgentProcessor:
             
             # Create structured task description
             task_description = f"""
-🔄 CHAT HISTORY BEACHTUNG - WICHTIG:
-{'Du siehst eine Chat History mit vorherigen Nachrichten. BERÜCKSICHTIGE diese aktiv:' if has_history else 'Dies ist eine neue Unterhaltung ohne vorherige Chat History.'}
-{'''
-- Beziehe dich auf vorherige Fragen und Antworten
-- Nutze den Kontext aus früheren Nachrichten  
-- Wenn der Nutzer "dazu", "darüber", "das" oder ähnliche Bezugswörter verwendet, beziehe dich auf vorherige Themen
-- Beantworte Rückfragen oder Nachfragen basierend auf dem bisherigen Gesprächsverlauf
-- Vermeide Wiederholungen bereits gegebener Antworten, es sei denn, es wird explizit verlangt
-- Erkenne den Kontext der aktuellen Frage im Zusammenhang mit der Chat History
+Hey! {'''Du siehst hier unsere bisherige Unterhaltung - schau sie dir an und beziehe dich darauf:
 
-VORHERIGE UNTERHALTUNG:
-''' + chat_context if has_history else ''}
+BISHERIGE UNTERHALTUNG:
+''' + chat_context if has_history else 'Das ist der Anfang unserer Unterhaltung!'}
 
-AKTUELLE FRAGE: {question}
+AKTUELLE NACHRICHT: {question}
 
-DEINE AUFGABE:
-1. Durchsuche relevante Dokumente mit dem PDF Search Tool
-2. Analysiere die gefundenen Informationen
-3. Beziehe Chat-History-Kontext ein, falls vorhanden
-4. Erstelle eine strukturierte, präzise Antwort
+WIE DU ANTWORTEN SOLLST:
+• Sei natürlich und gesprächig - wie ein echter Studienbuddy
+• Wenn die Frage mit verfügbaren Dokumenten beantwortet werden kann, nutze deine Tools intelligent
+• ABER: Du musst nicht immer suchen! Oft reicht dein Allgemeinwissen völlig aus
+• Bei Small Talk, allgemeinen Fragen oder Unterhaltung - einfach normal antworten
+• Sei locker, freundlich und authentisch
+• Beziehe dich auf vorherige Nachrichten wenn relevant
 
-VERHALTEN:
-- Stütze deine Antworten auf die bereitgestellten Quellen
-- Antworte natürlich und direkt, als würdest du mit Studierenden sprechen
-- Bei Widersprüchen: Bevorzuge hochschulspezifische Informationen
-- Bei fehlenden Informationen: Sage es klar und biete Hilfe an
-- Gib ausführliche, aber präzise Antworten
-- Verwende NIEMALS Anführungszeichen in der JSON-Antwort
+WANN UND WIE SUCHST DU IN DOKUMENTEN?
+• Bei spezifischen Fragen zu Studiengängen, Kursen, Prüfungen
+• Bei Fragen zu universitären Regelungen oder Verfahren  
+• Wenn explizit nach Dokumenteninhalten gefragt wird
+• NICHT bei: Smalltalk, allgemeinen Fragen, persönlichen Gesprächen
 
-WICHTIG: Deine Antwort MUSS in folgendem JSON-Format sein:
+INTELLIGENTER TOOL-WORKFLOW:
+1. Für dokumentenbasierte Fragen: Nutze ZUERST das "Document Overview Tool" um zu sehen welche Dokumente verfügbar sind
+2. Basierend auf der Übersicht: Entscheide welche Dokumente relevant sein könnten
+3. Nutze dann das "PDF Search Tool" mit spezifischen document_ids für präzise Suchen
+4. Alternativ: Suche in allen Dokumenten wenn du unsicher bist welche relevant sind
+
+WICHTIG - UMGANG MIT TOOL-ERGEBNISSEN:
+• Wenn das PDF Search Tool "KEINE DOKUMENTE GEFUNDEN" zurückgibt: Antworte mit deinem Allgemeinwissen, aber sage klar dass keine spezifischen Dokumente verfügbar sind
+• Wenn das Tool "FEHLER" zurückgibt: Erkläre das Problem und antworte trotzdem hilfreich
+• NIEMALS Quellen oder Dokument-IDs erfinden wenn das Tool keine liefert!
+• Sei ehrlich wenn keine Dokumente gefunden wurden
+
+ANTWORTFORMAT - WICHTIG:
+Deine Antwort muss IMMER in diesem JSON-Format sein (ohne Markdown-Blöcke):
 {{
-    "answer": "Deine ausführliche Antwort hier ohne Anführungszeichen",
-    "document_ids": ["doc1", "doc2"],
-    "sources": ["Originaltext aus den Dokumenten, der die Antwort stützt"],
+    "answer": "Deine natürliche, freundliche Antwort hier",
+    "document_ids": ["extrahiere diese aus [SYSTEM_INFO] FOUND_DOCUMENT_IDS wenn du das PDF Search Tool verwendet hast"],
+    "sources": ["nur relevante Quellen aus den Dokumenten"],
     "confidence_score": 0.9,
     "context_used": {str(has_history).lower()},
     "additional_info": "Zusätzliche Hinweise oder null"
 }}
+
+WICHTIG FÜR DOCUMENT_IDS:
+- Wenn du das PDF Search Tool verwendest, extrahiere die document_ids aus der Zeile "[SYSTEM_INFO] FOUND_DOCUMENT_IDS: [...]" 
+- Wenn du das Tool nicht verwendest, lass document_ids leer: []
+- Verwende nur die echten document_ids aus den Suchergebnissen, erfinde keine!
+
+Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
 """
             
             task = Task(
                 description=task_description,
-                expected_output="Eine strukturierte JSON-Antwort mit answer, document_ids, sources, confidence_score, context_used und additional_info Feldern. Die Antwort sollte präzise, gut begründet und in deutscher Sprache verfasst sein.",
+                expected_output="Eine natürliche, freundliche Antwort im JSON-Format. Nutze Dokumente nur wenn wirklich nötig. Sei gesprächig und authentisch wie ein echter Studienbuddy.",
                 agent=researcher
             )
             
@@ -473,7 +574,7 @@ WICHTIG: Deine Antwort MUSS in folgendem JSON-Format sein:
                 firebase_result = self._firebase.append_metadata(
                     namespace=namespace,
                     fileID=fileID,
-                    chunks=len(processed_pdf["chunks"]),
+                    chunk_count=len(processed_pdf["chunks"]),
                     keywords=[],  # Could be extracted if needed
                     summary=processed_pdf["summary"]
                 )
@@ -543,16 +644,33 @@ WICHTIG: Deine Antwort MUSS in folgendem JSON-Format sein:
         """
         try:
             if self._firebase_available:
-                namespace_data = self._firebase.get_namespace_data(namespace)
-                if namespace_data:
+                firebase_result = self._firebase.get_namespace_data(namespace)
+                
+                if firebase_result.get("status") == "success" and firebase_result.get("data"):
+                    namespace_data = firebase_result["data"]
                     documents = []
                     for doc_id, doc_data in namespace_data.items():
-                        if isinstance(doc_data, dict):
-                            documents.append({
+                        # Skip non-document entries (like standalone 'date' field)
+                        if isinstance(doc_data, dict) and "chunk_count" in doc_data:
+                            # Extract document information from Firebase structure
+                            document_info = {
                                 "id": doc_id,
-                                "summary": doc_data.get("summary", ""),
-                                "chunks": doc_data.get("chunks", 0)
-                            })
+                                "name": doc_data.get("name", doc_id),
+                                "summary": doc_data.get("summary", "Keine Zusammenfassung verfügbar"),
+                                "chunk_count": doc_data.get("chunk_count", doc_data.get("chunks", 0)),
+                                "status": doc_data.get("status", "Unknown"),
+                                "date": doc_data.get("date", ""),
+                                "processing": doc_data.get("processing", False),
+                                "progress": doc_data.get("progress", 0),
+                                "path": doc_data.get("path", ""),
+                                "storageURL": doc_data.get("storageURL", "")
+                            }
+                            
+                            # Add additional_info if it exists
+                            if "additional_info" in doc_data:
+                                document_info["additional_info"] = doc_data["additional_info"]
+                            
+                            documents.append(document_info)
                     
                     return {
                         "status": "success",

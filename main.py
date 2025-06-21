@@ -283,20 +283,11 @@ async def send_message_structured(user_input: str = Form(...), namespace: str = 
         if len(chat_state.chat_history[namespace]) > 20:
             chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
         
-        return {
-            "status": "success",
-            "message": "Structured response generated successfully",
-            "namespace": namespace,
-            "user_input": user_input,
-            "structured_response": structured_response
-        }
+        return structured_response
         
     except Exception as e:
         print(f"Error in send_message_structured: {str(e)}")
         return {
-            "status": "error",
-            "message": f"Error processing message: {str(e)}",
-            "structured_response": {
                 "answer": f"Fehler: {str(e)}",
                 "document_ids": [],
                 "sources": [],
@@ -304,7 +295,7 @@ async def send_message_structured(user_input: str = Form(...), namespace: str = 
                 "context_used": False,
                 "additional_info": f"Exception: {type(e).__name__}"
             }
-        }
+        
 
 @app.post("/create_namespace")
 async def create_namespace(namespace: str = Form(...), dimension: int = Form(DEFAULT_DIMENSION)):
@@ -637,11 +628,15 @@ async def get_namespace_info(namespace: str):
         }
 
 if __name__ == "__main__":
+    # Für lokale Entwicklung mit Reload-Funktionalität
     port = int(os.environ.get("PORT", 8000))
+    reload = os.environ.get("ENVIRONMENT", "production") == "development"
+    
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=port,
+        reload=reload,
         timeout_keep_alive=120,
         timeout_graceful_shutdown=120
     )

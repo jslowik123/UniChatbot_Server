@@ -1,6 +1,5 @@
 from celery import Celery
 import os
-import ssl
 
 # Constants
 DEFAULT_REDIS_URL = "redis://localhost:6379"
@@ -16,21 +15,10 @@ celery = Celery(
     include=['tasks']
 )
 
-# SSL Configuration for secure Redis connections (e.g., Heroku Redis)
-ssl_config = {
-    'ssl_cert_reqs': ssl.CERT_NONE,
-    'ssl_ca_certs': None,
-    'ssl_certfile': None,
-    'ssl_keyfile': None,
-    'ssl_check_hostname': False
-}
-
 # Configure Celery
 celery.conf.update(
     broker_url=redis_url,
     result_backend=redis_url,
-    broker_use_ssl=ssl_config,
-    redis_backend_use_ssl=ssl_config,
     broker_connection_retry_on_startup=True,
     task_track_started=True,
     task_serializer='json',
