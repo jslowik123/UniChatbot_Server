@@ -319,7 +319,7 @@ class AgentProcessor:
                     target_doc_ids = [doc_id.strip() for doc_id in document_ids.split(',') if doc_id.strip()]
                     print(f"🔍 Suche beschränkt auf Dokumente: {target_doc_ids}")
                 
-                docs = compression_retriever.get_relevant_documents(query)
+                docs = compression_retriever.invoke(query)
                 
                 if not docs:
                     return "KEINE DOKUMENTE GEFUNDEN: Es wurden keine relevanten Dokumente für diese Anfrage gefunden. Der Namespace könnte leer sein oder die Anfrage passt zu keinem verfügbaren Inhalt."
@@ -451,7 +451,7 @@ Deine Antwort muss IMMER in diesem JSON-Format sein (ohne Markdown-Blöcke):
 {{
     "answer": "Deine natürliche, freundliche Antwort hier",
     "document_ids": ["extrahiere diese aus [SYSTEM_INFO] FOUND_DOCUMENT_IDS wenn du das PDF Search Tool verwendet hast"],
-    "sources": ["nur relevante Quellen aus den Dokumenten"],
+    "sources": ["Hier übernimmst du 1zu1 die sätze aus den Quellen die du verwendet hast, in derselben Reihenfolge wie die Dokumenten IDs, die Sätze kannst du richtig formatieren."],
     "confidence_score": 0.9,
     "context_used": {str(has_history).lower()},
     "additional_info": "Zusätzliche Hinweise oder null"
@@ -461,7 +461,7 @@ WICHTIG FÜR DOCUMENT_IDS:
 - Wenn du das PDF Search Tool verwendest, extrahiere die document_ids aus der Zeile "[SYSTEM_INFO] FOUND_DOCUMENT_IDS: [...]" 
 - Wenn du das Tool nicht verwendest, lass document_ids leer: []
 - Verwende nur die echten document_ids aus den Suchergebnissen, erfinde keine!
-
+- Gib nur die document_ids aus, die du auch wirklich verwendet hast um die Antwort zu erstellen!
 Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
 """
             
@@ -604,32 +604,68 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
         Returns:
             Dict containing deletion status
         """
+        pinecone_deleted = False
+        firebase_deleted = False
+        
         try:
-            # Delete from Pinecone
-            vectorstore = self.setup_vectorstore(namespace)
-            # Note: We need to delete by metadata filter
-            # This requires using the Pinecone client directly
             index = self._pc.Index(self._index_name)
-            index.delete(
+            
+            # Query to get all vector IDs for the fileID
+            query_response = index.query(
                 namespace=namespace,
-                filter={"pdf_id": fileID}
+                top_k=10000,  # A high number to fetch all vectors
+                filter={"document_id": fileID},
+                include_values=False,
+                include_metadata=False,
             )
+            
+            vector_ids = [match['id'] for match in query_response['matches']]
+            
+            if vector_ids:
+                index.delete(ids=vector_ids, namespace=namespace)
+                pinecone_deleted = True
             
             # Delete from Firebase if available
             firebase_result = {"status": "success", "message": "Firebase not available"}
             if self._firebase_available:
                 firebase_result = self._firebase.delete_document_metadata(namespace, fileID)
+                if firebase_result.get("status") == "success":
+                    firebase_deleted = True
             
             return {
                 "status": "success",
-                "message": f"Document {fileID} deleted successfully",
-                "firebase_result": firebase_result
+                "message": f"Document {fileID} deleted. Pinecone: {pinecone_deleted}, Firebase: {firebase_deleted}",
+                "firebase_result": firebase_result,
+                "deleted_vector_count": len(vector_ids)
             }
             
         except Exception as e:
             return {
                 "status": "error",
                 "message": f"Error deleting document: {str(e)}"
+            }
+
+    def delete_namespace(self, namespace: str) -> Dict[str, Any]:
+        """
+        Delete an entire namespace from the Pinecone index.
+        
+        Args:
+            namespace: The name of the namespace to delete.
+            
+        Returns:
+            A dictionary with the status of the operation.
+        """
+        try:
+            index = self._pc.Index(self._index_name)
+            index.delete(namespace=namespace, delete_all=True)
+            return {
+                "status": "success",
+                "message": f"Namespace {namespace} deleted from Pinecone."
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Error deleting namespace from Pinecone: {str(e)}"
             }
 
     def get_namespace_summary(self, namespace: str) -> Dict[str, Any]:

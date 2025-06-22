@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 from agent_processor import AgentProcessor
-from agent_chatbot import get_bot, message_bot, message_bot_structured, message_bot_stream
+from agent_chatbot import get_bot, message_bot_agent
 from firebase_connection import FirebaseConnection
 from celery_app import test_task, celery
 from tasks import process_document
@@ -14,6 +14,7 @@ from redis import Redis
 import json
 import asyncio
 from celery.exceptions import Ignore
+from starlette.responses import JSONResponse
 
 # Load environment variables
 load_dotenv()
@@ -172,7 +173,7 @@ async def start_bot():
     """
     try:
         chat_state.agent_chatbot = get_bot()
-        result = chat_state.agent_chatbot.start_bot()
+        result = chat_state.agent_chatbot.start_bot_agent()
         chat_state.chat_history = {}
         return result
     except Exception as e:
@@ -181,64 +182,9 @@ async def start_bot():
             "message": f"Error starting agent bot: {str(e)}"
         }
 
+
 @app.post("/send_message")
 async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
-    """
-    Send a message to the CrewAI agent and get a complete response.
-    
-    Args:
-        user_input: User's question or message  
-        namespace: Namespace to search for relevant documents
-        
-    Returns:
-        Dict containing the agent's response and metadata
-    """
-    if not chat_state.agent_chatbot:
-        return {
-            "status": "error",
-            "message": "Agent bot not started. Please call /start_bot first",
-            "response": ""
-        }
-    
-    try:
-        # Get or initialize chat history for this namespace
-        if namespace not in chat_state.chat_history:
-            chat_state.chat_history[namespace] = []
-        
-        history = chat_state.chat_history[namespace]
-        
-        # Use the message_bot function to get complete response
-        response = message_bot(
-            user_input, "", "", None, 
-            "", history, namespace
-        )
-        
-        # Update chat history
-        chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
-        chat_state.chat_history[namespace].append({"role": "assistant", "content": response})
-        
-        # Keep only last 20 messages to prevent memory overflow
-        if len(chat_state.chat_history[namespace]) > 20:
-            chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
-        
-        return {
-            "status": "success",
-            "message": "Response generated successfully",
-            "response": response,
-            "namespace": namespace,
-            "user_input": user_input
-        }
-        
-    except Exception as e:
-        print(f"Error in send_message: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Error processing message: {str(e)}",
-            "response": ""
-        }
-
-@app.post("/send_message_structured")
-async def send_message_structured(user_input: str = Form(...), namespace: str = Form(...)):
     """
     Send a message to the CrewAI agent and get a structured response with metadata.
     
@@ -271,7 +217,7 @@ async def send_message_structured(user_input: str = Form(...), namespace: str = 
         history = chat_state.chat_history[namespace]
         
         # Use the structured message_bot function
-        structured_response = message_bot_structured(
+        structured_response = message_bot_agent(
             user_input, namespace, history
         )
         
@@ -327,35 +273,33 @@ async def create_namespace(namespace: str = Form(...), dimension: int = Form(DEF
 async def delete_namespace(namespace: str = Form(...)):
     """
     Delete a namespace from Pinecone index and Firebase metadata.
-    
     Args:
         namespace: Name of the namespace to delete
-        
-    Returns:
-        Dict containing deletion status from both services
     """
     try:
-        # Delete all documents in namespace using Pinecone client
-        index = agent_processor._pc.Index(agent_processor._index_name)
-        index.delete(namespace=namespace, delete_all=True)
+        # Delete namespace from Pinecone using AgentProcessor
+        pinecone_result = agent_processor.delete_namespace(namespace)
         
+        if pinecone_result.get("status") == "error":
+            # Log the error and potentially return it
+            print(f"Error deleting namespace from Pinecone: {pinecone_result.get('message')}")
+            # Decide if you want to stop or continue if Pinecone fails
+            # For now, we'll return the error immediately
+            return JSONResponse(status_code=500, content=pinecone_result)
+
         # Delete Firebase metadata if available
-        firebase_result = {"status": "success", "message": "Firebase not available"}
-        if agent_processor._firebase_available:
+        firebase_result = {"status": "success", "message": "Firebase not available or not configured for this agent."}
+        if hasattr(agent_processor, '_firebase_available') and agent_processor._firebase_available:
             firebase_result = agent_processor._firebase.delete_namespace_metadata(namespace)
         
-        return {
-            "status": "success", 
-            "message": f"Namespace {namespace} deleted successfully",
-            "pinecone_status": "success",
-            "firebase_status": firebase_result["status"],
-            "firebase_message": firebase_result["message"]
-        }
+        return JSONResponse(content={
+            "message": f"Namespace {namespace} deletion process completed.",
+            "pinecone_result": pinecone_result,
+            "firebase_result": firebase_result
+        })
+        
     except Exception as e:
-        return {
-            "status": "error", 
-            "message": f"Error deleting namespace: {str(e)}"
-        }
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/test_worker")
 async def test_worker():
@@ -488,19 +432,19 @@ async def get_task_status(task_id: str):
     """
     try:
         task = celery.AsyncResult(task_id)
-        print(f"Agent Task state: {task.state}")
-        print(f"Agent Task info: {task.info}")
-        print(f"Agent Task result: {task.result}")
+        print(f"Task state: {task.state}")
+        print(f"Task info: {task.info}")
+        print(f"Task result: {task.result}")
         
         response = _handle_task_state(task)
-        print(f"Sending agent response: {response}")
+        print(f"Sending response: {response}")
         return response
         
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
-        print(f"Error in agent task status: {str(e)}")
+        print(f"Error in task status: {str(e)}")
         error_detail = {
             'state': 'ERROR',
             'status': 'ERROR',
@@ -544,63 +488,66 @@ async def send_message_stream(user_input: str = Form(...), namespace: str = Form
     if not chat_state.agent_chatbot:
         return StreamingResponse(
             _stream_error_response("Agent bot not started. Please call /start_bot first"),
-            media_type="text/plain",
+            media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*",
             }
         )
     
     async def generate_response():
         try:
-            # Send initial processing event
-            yield f"data: {json.dumps({'type': 'chunk', 'content': ''})}\n\n"
-            await asyncio.sleep(0.1)
-            
             # Get or initialize chat history for this namespace
             if namespace not in chat_state.chat_history:
                 chat_state.chat_history[namespace] = []
             
             history = chat_state.chat_history[namespace]
             
-            # Stream the AI agent response in real-time
+            # Use the chatbot's stream_message method
+            chatbot = get_bot()
             accumulated_response = ""
             
-            for chunk in message_bot_stream(
-                user_input, "", "", None, 
-                "", history, namespace
-            ):
-                accumulated_response += chunk
-                
-                # Send chunk event with only the new chunk content
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-                await asyncio.sleep(STREAM_DELAY)  # Prevent overwhelming the client
+            # Send initial processing event
+            yield f"data: {json.dumps({'type': 'start'})}\n\n"
             
-            # Update chat history after streaming is complete
+            async for chunk in chatbot.stream_message(user_input, namespace, history):
+                accumulated_response += chunk
+                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+            
+            # Update chat history
             chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
             chat_state.chat_history[namespace].append({"role": "assistant", "content": accumulated_response})
             
-            # Keep only last 20 messages to prevent memory overflow
+            # Keep only last 20 messages
             if len(chat_state.chat_history[namespace]) > 20:
                 chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
             
-            # Send completion event
-            yield f"data: {json.dumps({'type': 'complete', 'fullResponse': accumulated_response})}\n\n"
+            # Send completion event with structured data
+            final_response = {
+                "type": "complete",
+                "fullResponse": accumulated_response,
+                "structured_response": {
+                    "answer": accumulated_response,
+                    "document_ids": [],  # Placeholder
+                    "sources": [],  # Placeholder
+                    "confidence_score": 0.95,  # Placeholder
+                    "context_used": True,  # Placeholder
+                }
+            }
+            yield f"data: {json.dumps(final_response)}\n\n"
             
         except Exception as e:
             print(f"Error in send_message_stream: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error processing message: {str(e)}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     
     return StreamingResponse(
         generate_response(),
-        media_type="text/plain",
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
         }
     )
 

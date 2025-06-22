@@ -55,7 +55,7 @@ echo "✅ Redis Server läuft"
 
 # Starte Celery Worker
 echo "👷 Starte Celery Worker..."
-celery -A celery_app worker --loglevel=info &
+venv/bin/celery -A celery_app worker --loglevel=info &
 WORKER_PID=$!
 
 # Warte kurz bis Worker startet
@@ -63,7 +63,7 @@ sleep 3
 
 # Starte FastAPI Server
 echo "🌐 Starte FastAPI Server..."
-python main.py &
+venv/bin/python3 main.py &
 SERVER_PID=$!
 
 echo ""

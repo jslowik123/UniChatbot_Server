@@ -6,7 +6,7 @@ python-multipart==0.0.9
 # PDF Processing
 pdfplumber==0.11.4
 
-# LangChain Core (updated to current working versions)
+# LangChain
 langchain==0.3.9
 langchain-core==0.3.63
 langchain-openai==0.3.19
@@ -18,7 +18,7 @@ langchain-text-splitters==0.3.8
 crewai==0.130.0
 
 # Vector Database
-pinecone-client==5.0.1
+pinecone==7.2.0
 
 # OpenAI
 openai==1.90.0
@@ -30,14 +30,11 @@ redis==5.0.8
 # Data Processing
 pydantic==2.9.2
 
-# Firebase
+# Firebase & Dependencies
 firebase-admin==6.5.0
+protobuf==5.29.5
+grpcio-status==1.71.0
 
 # Additional dependencies
 python-dotenv==1.0.1
 tiktoken==0.8.0
-
-# Additional dependencies that may be needed
-requests==2.32.4
-numpy==2.3.0
-aiohttp==3.12.13 
