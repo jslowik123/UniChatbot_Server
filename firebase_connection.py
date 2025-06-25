@@ -129,7 +129,7 @@ class FirebaseConnection:
         pass
 
     def append_metadata(self, namespace: str, fileID: str, chunk_count: int, 
-                       keywords: List[str], summary: str) -> Dict[str, Any]:
+                       keywords: List[str], summary: str, vector_ids: list = None) -> Dict[str, Any]:
         """
         Store or update document metadata in Firebase.
         
@@ -139,6 +139,7 @@ class FirebaseConnection:
             chunk_count: Number of text chunks created
             keywords: List of extracted keywords
             summary: Document summary
+            vector_ids: List of vector IDs
             
         Returns:
             Dict containing operation status and information
@@ -166,6 +167,9 @@ class FirebaseConnection:
                 'keywords': combined_keywords,
                 'summary': summary,
             }
+            
+            if vector_ids is not None:
+                updated_data['vector_ids'] = vector_ids
             
             # Update only changed fields
             for key, value in updated_data.items():
@@ -419,4 +423,31 @@ class FirebaseConnection:
                 'status': 'error',
                 'message': f'Error updating global namespace summary: {str(e)}'
             }
+
+    def set_project_info(self, project_name: str, info: str) -> Dict[str, Any]:
+        """
+        Speichert eine Info für ein Projekt unter projects/{project_name}/info.
+        """
+        try:
+            if not firebase_admin._apps:
+                return {'status': 'error', 'message': 'Firebase app not initialized'}
+            ref = self._db.reference(f'files/{project_name}/info')
+            ref.set(info)
+            return {'status': 'success', 'message': f'Info für Projekt {project_name} gespeichert.'}
+        except Exception as e:
+            return {'status': 'error', 'message': f'Fehler beim Speichern: {str(e)}'}
+
+    def get_project_info(self, project_name: str) -> Dict[str, Any]:
+        """
+        Holt die Info für ein Projekt unter projects/{project_name}/info.
+        """
+        try:
+            ref = self._db.reference(f'files/{project_name}/info')
+            info = ref.get()
+            if info is not None:
+                return {'status': 'success', 'project_name': project_name, 'info': info}
+            else:
+                return {'status': 'not_found', 'message': f'Keine Info für Projekt {project_name} gefunden.'}
+        except Exception as e:
+            return {'status': 'error', 'message': f'Fehler beim Abrufen: {str(e)}'}
 

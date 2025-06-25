@@ -15,6 +15,8 @@ from firebase_connection import FirebaseConnection
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import json
+import logging
+import traceback
 
 load_dotenv()
 
@@ -23,8 +25,9 @@ EMBEDDING_MODEL = "text-embedding-ada-002"
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_TEMPERATURE = 0.7
-GPT_MODEL = "gpt-4"
+GPT_MODEL = "gpt-4.1-mini"
 
+logger = logging.getLogger(__name__)
 
 class StructuredResponse(BaseModel):
     """Structured response model for agent outputs."""
@@ -219,8 +222,19 @@ class AgentProcessor:
                 for i in range(len(processed_pdf["chunks"]))
             ] + [{"pdf_id": fileID, "document_id": fileID, "type": "summary"}]
             
-            # Add texts to vectorstore
-            vectorstore.add_texts(texts=texts, metadatas=metadatas)
+            # Add texts to vectorstore und speichere die IDs
+            ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"]
+            vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+            # Speichere die IDs in Firebase
+            if self._firebase_available:
+                self._firebase.append_metadata(
+                    namespace=namespace,
+                    fileID=fileID,
+                    chunk_count=len(processed_pdf["chunks"]),
+                    keywords=[],
+                    summary=processed_pdf["summary"],
+                    vector_ids=ids
+                )
             
             return {
                 "status": "success",
@@ -594,38 +608,19 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
             }
 
     def delete_document(self, namespace: str, fileID: str) -> Dict[str, Any]:
-        """
-        Delete document from vectorstore and Firebase.
-        
-        Args:
-            namespace: Document namespace
-            fileID: Document identifier
-            
-        Returns:
-            Dict containing deletion status
-        """
         pinecone_deleted = False
         firebase_deleted = False
-        
         try:
             index = self._pc.Index(self._index_name)
-            
-            # Query to get all vector IDs for the fileID
-            query_response = index.query(
-                namespace=namespace,
-                top_k=10000,  # A high number to fetch all vectors
-                filter={"document_id": fileID},
-                include_values=False,
-                include_metadata=False,
+            index.delete(
+            filter={
+                "pdf_id": {"$eq": fileID}
+            },
+            namespace=namespace
             )
+            pinecone_deleted = True
             
-            vector_ids = [match['id'] for match in query_response['matches']]
-            
-            if vector_ids:
-                index.delete(ids=vector_ids, namespace=namespace)
-                pinecone_deleted = True
-            
-            # Delete from Firebase if available
+            # Firebase-Löschung immer ausführen!
             firebase_result = {"status": "success", "message": "Firebase not available"}
             if self._firebase_available:
                 firebase_result = self._firebase.delete_document_metadata(namespace, fileID)
@@ -634,12 +629,11 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
             
             return {
                 "status": "success",
-                "message": f"Document {fileID} deleted. Pinecone: {pinecone_deleted}, Firebase: {firebase_deleted}",
-                "firebase_result": firebase_result,
-                "deleted_vector_count": len(vector_ids)
+                "message": f"Document {fileID} deleted. Pinecone: {pinecone_deleted}, Firebase: {firebase_deleted}"
             }
-            
         except Exception as e:
+            logger.error(f"Fehler beim Löschen des Dokuments {fileID} im Namespace {namespace}: {str(e)}")
+            logger.error(traceback.format_exc())
             return {
                 "status": "error",
                 "message": f"Error deleting document: {str(e)}"
@@ -670,7 +664,7 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
 
     def get_namespace_summary(self, namespace: str) -> Dict[str, Any]:
         """
-        Generate a summary of all documents in a namespace.
+        Generate a summary of all documents in a namespace, now supporting sections.
         
         Args:
             namespace: Namespace identifier
@@ -679,50 +673,55 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
             Dict containing namespace summary
         """
         try:
+            project_info = None
             if self._firebase_available:
-                firebase_result = self._firebase.get_namespace_data(namespace)
+                # Hole die Projektinfo explizit
+                project_info_result = self._firebase.get_project_info(namespace)
+                if project_info_result.get("status") == "success":
+                    project_info = project_info_result.get("info")
                 
+                firebase_result = self._firebase.get_namespace_data(namespace)
                 if firebase_result.get("status") == "success" and firebase_result.get("data"):
                     namespace_data = firebase_result["data"]
                     documents = []
-                    for doc_id, doc_data in namespace_data.items():
-                        # Skip non-document entries (like standalone 'date' field)
-                        if isinstance(doc_data, dict) and "chunk_count" in doc_data:
-                            # Extract document information from Firebase structure
-                            document_info = {
-                                "id": doc_id,
-                                "name": doc_data.get("name", doc_id),
-                                "summary": doc_data.get("summary", "Keine Zusammenfassung verfügbar"),
-                                "chunk_count": doc_data.get("chunk_count", doc_data.get("chunks", 0)),
-                                "status": doc_data.get("status", "Unknown"),
-                                "date": doc_data.get("date", ""),
-                                "processing": doc_data.get("processing", False),
-                                "progress": doc_data.get("progress", 0),
-                                "path": doc_data.get("path", ""),
-                                "storageURL": doc_data.get("storageURL", "")
-                            }
-                            
-                            # Add additional_info if it exists
-                            if "additional_info" in doc_data:
-                                document_info["additional_info"] = doc_data["additional_info"]
-                            
-                            documents.append(document_info)
-                    
+                    # Jetzt: namespace_data = {section: {doc_id: doc_data, ...}, ...}
+                    for section, section_docs in namespace_data.items():
+                        if not isinstance(section_docs, dict):
+                            continue  # skip non-section entries
+                        for doc_id, doc_data in section_docs.items():
+                            # Skip non-document entries (wie z.B. section-Metadaten)
+                            if isinstance(doc_data, dict) and "chunk_count" in doc_data:
+                                document_info = {
+                                    "id": doc_id,
+                                    "name": doc_data.get("name", doc_id),
+                                    "summary": doc_data.get("summary", "Keine Zusammenfassung verfügbar"),
+                                    "chunk_count": doc_data.get("chunk_count", doc_data.get("chunks", 0)),
+                                    "status": doc_data.get("status", "Unknown"),
+                                    "date": doc_data.get("date", ""),
+                                    "processing": doc_data.get("processing", False),
+                                    "progress": doc_data.get("progress", 0),
+                                    "path": doc_data.get("path", ""),
+                                    "storageURL": doc_data.get("storageURL", ""),
+                                    "section": section  # NEU: Section hinzufügen
+                                }
+                                if "additional_info" in doc_data:
+                                    document_info["additional_info"] = doc_data["additional_info"]
+                                documents.append(document_info)
                     return {
                         "status": "success",
                         "namespace": namespace,
                         "document_count": len(documents),
-                        "documents": documents
+                        "documents": documents,
+                        "project_info": project_info
                     }
-            
             return {
                 "status": "success",
                 "namespace": namespace,
                 "document_count": 0,
                 "documents": [],
+                "project_info": project_info,
                 "message": "No documents found or Firebase not available"
             }
-            
         except Exception as e:
             return {
                 "status": "error",

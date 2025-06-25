@@ -1,3 +1,6 @@
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -88,7 +91,7 @@ async def root():
     }
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...)):
+async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...), abschnitt: str = Form(...)):
     """
     Upload and process a PDF document asynchronously using AgentProcessor.
     
@@ -244,7 +247,7 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
         
 
 @app.post("/create_namespace")
-async def create_namespace(namespace: str = Form(...), dimension: int = Form(DEFAULT_DIMENSION)):
+async def create_namespace(namespace: str = Form(...),dimension: int = Form(DEFAULT_DIMENSION)):
     """
     Create a new namespace in the Pinecone index using AgentProcessor.
     
@@ -574,16 +577,37 @@ async def get_namespace_info(namespace: str):
             "message": f"Error getting namespace info: {str(e)}"
         }
 
+@app.post("/set_project_info")
+async def set_project_info(project_name: str = Form(...), info: str = Form(...)):
+    """
+    Setzt eine Info für ein Projekt in Firebase.
+    """
+    try:
+        firebase_result = agent_processor._firebase.set_project_info(project_name, info)
+        return firebase_result
+    except Exception as e:
+        return {"status": "error", "message": f"Fehler beim Speichern der Projektinfo: {str(e)}"}
+
+@app.get("/get_project_info")
+async def get_project_info(project_name: str):
+    """
+    Holt die Info für ein Projekt aus Firebase.
+    """
+    try:
+        firebase_result = agent_processor._firebase.get_project_info(project_name)
+        return firebase_result
+    except Exception as e:
+        return {"status": "error", "message": f"Fehler beim Abrufen der Projektinfo: {str(e)}"}
+
 if __name__ == "__main__":
     # Für lokale Entwicklung mit Reload-Funktionalität
     port = int(os.environ.get("PORT", 8000))
-    reload = os.environ.get("ENVIRONMENT", "production") == "development"
-    
+    # reload immer True für Entwicklung
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=port,
-        reload=reload,
+        reload=True,
         timeout_keep_alive=120,
         timeout_graceful_shutdown=120
     )
