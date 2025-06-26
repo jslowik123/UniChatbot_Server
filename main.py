@@ -153,6 +153,10 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
         if just_firebase.lower() == "true":
             # Delete using AgentProcessor
             result = agent_processor.delete_document(namespace, fileID)
+            
+            # Trigger assessment update after deletion
+            generate_assessment.delay(namespace)
+            
             return {
                 "status": result["status"], 
                 "message": result["message"],
@@ -161,6 +165,10 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
         else:
             # Delete using AgentProcessor (handles both Pinecone and Firebase)
             result = agent_processor.delete_document(namespace, fileID)
+            
+            # Trigger assessment update after deletion
+            generate_assessment.delay(namespace)
+            
             return {
                 "status": result["status"], 
                 "message": result["message"],
@@ -618,22 +626,38 @@ def get_assessment_data(namespace: str, additional_info: str):
     system_prompt = """
     Du bist ein Experte für Bildungstechnologie und Wissensanalyse. Ein Benutzer möchte einen Chatbot für Studierende erstellen. Dazu hat er Dokumente hochgeladen, die das Fachwissen des Chatbots bilden sollen. Außerdem hat er eine Zielbeschreibung beigefügt, was der Chatbot ungefähr können oder leisten soll.
 
-    Deine Aufgabe ist:
-    1. Lese dir die Dokumenten Übersicht durch.
-    2. Überprüfe ob die Dokumente ausreichen, um das Ziel zu erreichen.
-    3. Identifiziere Lücken oder fehlende Themenbereiche.
-    4. Gib konkrete Empfehlungen, welche weiteren Dokumente, Themen oder Inhalte hinzugefügt werden sollten, damit der Chatbot die gewünschte Aufgabe gut erfüllen kann.
-    5. Beachte der Chatbot soll rein informativ sein und zu den organisatorischen und generellen Fragen dinge beantworten.
-    6. Antworte in einem Structured Output Format, mit den drei Feldern: "Vorhandne", "Missing", "Tipps (Stichpunkte),", "Confidence".
-    7. in Confidence gibst du an zu wie viel prozent der chatbot die gewünschte Aufgabe erfüllen kann.
+    Deine Aufgabe ist eine strukturierte Analyse mit KURZEN STICHWORTEN zu erstellen:
 
-    Denke dabei an:
-    - Vollständigkeit und Relevanz
-    - Unterschiedliche Perspektiven (z. B. theoretisch, praktisch, rechtlich)
-    - Verständlichkeit für Studierende
+    WICHTIG: Antworte im JSON-Format mit exakt diesen Feldern:
+    {
+        "vorhanden": ["Stichwort 1", "Stichwort 2", "Stichwort 3"],
+        "fehlt": ["Fehlendes Dokument 1", "Fehlendes Dokument 2"],
+        "tipps": ["Kurzer Tipp 1", "Kurzer Tipp 2"],
+        "confidence": 85
+    }
 
-    Antworte strukturiert.
-    Antworte in deutscher Sprache.
+    Regeln für die Stichworte:
+    - "vorhanden": Kurze Namen der vorhandenen Dokumenttypen (z.B. "Modulhandbuch Bachelor", "Studienordnung")
+    - "fehlt": Konkrete fehlende Dokumenttypen (z.B. "Prüfungsordnung", "Stundenplan", "Praktikumsordnung")
+    - "tipps": Maximal 3-4 Wörter pro Tipp (z.B. "Aktuelle Prüfungstermine hinzufügen", "FAQ für Erstsemester")
+    - "confidence": Zahl zwischen 0-100 für wie vollständing deiner meinung nach der Chatbot ist, im Hinblick auf das Ziel.
+
+    WICHTIGE REGEL FÜR "FEHLT":
+    Analysiere die Zielbeschreibung des Chatbots genau. Wenn bestimmte Dokumenttypen für das spezifische Ziel NICHT RELEVANT sind, dann markiere sie NICHT als fehlend.
+    
+    Beispiele:
+    - Wenn der Chatbot nur für "allgemeine Studienberatung" gedacht ist → keine spezifischen Fachmodule als fehlend markieren
+    - Wenn der Chatbot nur für "Erstsemester-Info" gedacht ist → keine Master-spezifischen Dokumente als fehlend markieren
+    - Wenn der Chatbot nur für "einen spezifischen Studiengang" gedacht ist → keine anderen Studiengänge als fehlend markieren
+    - Wenn der Chatbot für "organisatorische Fragen" gedacht ist → keine fachlichen Inhalte als fehlend markieren
+
+    Fokussiere dich nur auf Dokumente, die für das SPEZIFISCHE ZIEL des Chatbots wirklich notwendig sind.
+
+    Denke an typische Universitätsdokumente:
+    - Modulhandbücher, Prüfungsordnungen, Studienordnungen
+    - Stundenpläne, Vorlesungsverzeichnis
+
+    Antworte NUR mit dem JSON-Objekt, keine weiteren Erklärungen.
     """
 
     user_prompt = f"""
@@ -646,6 +670,7 @@ def get_assessment_data(namespace: str, additional_info: str):
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",  # oder dein gewünschtes Modell
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_prompt.strip()},
