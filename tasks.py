@@ -119,8 +119,8 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
                     'status': 'Complete - Agent ready'
                 })
             
-            # Trigger the global summary generation task
-            generate_namespace_summary.delay(namespace)
+            # Trigger the assessment generation task
+            generate_assessment.delay(namespace)
             
             return {
                 'status': 'success',
@@ -191,4 +191,48 @@ def generate_namespace_summary(namespace: str):
         return {
             'status': 'error',
             'message': f"Failed to generate global summary: {str(e)}"
+        }
+
+
+@celery.task(name="tasks.generate_assessment")
+def generate_assessment(namespace: str):
+    """
+    Generate assessment data for a namespace after document processing is complete.
+    
+    This task is triggered after successful document processing to automatically
+    create an assessment of the chatbot's capabilities based on the uploaded documents.
+    
+    Args:
+        namespace: The namespace to generate assessment for
+        
+    Returns:
+        Dict containing assessment generation status and results
+    """
+    try:
+        # Import the assessment function from main
+        from main import get_assessment_data
+        
+        # Get the additional_info (project info) from Firebase
+        if agent_processor._firebase_available:
+            project_info_result = agent_processor._firebase.get_project_info(namespace)
+            if project_info_result.get("status") == "success":
+                additional_info = project_info_result.get("info", "")
+            else:
+                additional_info = "Keine spezifischen Ziele definiert."
+        else:
+            additional_info = "Firebase nicht verfügbar - keine Projektinfo verfügbar."
+        
+        # Generate the assessment
+        assessment_result = get_assessment_data(namespace, additional_info)
+        
+        return {
+            'status': 'success',
+            'message': f"Assessment generated for namespace: {namespace}",
+            'assessment_result': assessment_result
+        }
+        
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': f"Failed to generate assessment: {str(e)}"
         }

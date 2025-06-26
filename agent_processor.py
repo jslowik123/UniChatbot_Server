@@ -278,7 +278,7 @@ class AgentProcessor:
         
         # PDF Retriever Tool für CrewAI
         @tool("Document Overview Tool")
-        def document_overview_tool() -> str:
+        def document_overview_tool(namespace) -> str:
             """Zeigt eine Übersicht aller verfügbaren Dokumente im aktuellen Namespace mit deren Zusammenfassungen und IDs."""
             try:
                 summary_data = self.get_namespace_summary(namespace)
@@ -303,11 +303,9 @@ class AgentProcessor:
                         f"   Datum: {doc.get('date', 'Unbekannt')}",
                         f"   Zusammenfassung: {doc['summary'][:200]}{'...' if len(doc['summary']) > 200 else ''}",
                     ]
-                    
                     # Add additional_info if present
                     if doc.get('additional_info'):
                         doc_info.append(f"   Zusätzliche Info: {doc['additional_info']}")
-                    
                     doc_info.append("")  # Empty line for separation
                     overview_parts.extend(doc_info)
                 
@@ -662,51 +660,46 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
                 "message": f"Error deleting namespace from Pinecone: {str(e)}"
             }
 
-    def get_namespace_summary(self, namespace: str) -> Dict[str, Any]:
+    def get_namespace_summary(self, namespace: str):
         """
-        Generate a summary of all documents in a namespace, now supporting sections.
-        
+        Generate a summary of all documents in a namespace.
+
         Args:
             namespace: Namespace identifier
-            
+
         Returns:
             Dict containing namespace summary
         """
         try:
             project_info = None
             if self._firebase_available:
-                # Hole die Projektinfo explizit
                 project_info_result = self._firebase.get_project_info(namespace)
                 if project_info_result.get("status") == "success":
                     project_info = project_info_result.get("info")
-                
+
                 firebase_result = self._firebase.get_namespace_data(namespace)
                 if firebase_result.get("status") == "success" and firebase_result.get("data"):
                     namespace_data = firebase_result["data"]
                     documents = []
-                    # Jetzt: namespace_data = {section: {doc_id: doc_data, ...}, ...}
-                    for section, section_docs in namespace_data.items():
-                        if not isinstance(section_docs, dict):
-                            continue  # skip non-section entries
-                        for doc_id, doc_data in section_docs.items():
-                            # Skip non-document entries (wie z.B. section-Metadaten)
-                            if isinstance(doc_data, dict) and "chunk_count" in doc_data:
-                                document_info = {
-                                    "id": doc_id,
-                                    "name": doc_data.get("name", doc_id),
-                                    "summary": doc_data.get("summary", "Keine Zusammenfassung verfügbar"),
-                                    "chunk_count": doc_data.get("chunk_count", doc_data.get("chunks", 0)),
-                                    "status": doc_data.get("status", "Unknown"),
-                                    "date": doc_data.get("date", ""),
-                                    "processing": doc_data.get("processing", False),
-                                    "progress": doc_data.get("progress", 0),
-                                    "path": doc_data.get("path", ""),
-                                    "storageURL": doc_data.get("storageURL", ""),
-                                    "section": section  # NEU: Section hinzufügen
-                                }
-                                if "additional_info" in doc_data:
-                                    document_info["additional_info"] = doc_data["additional_info"]
-                                documents.append(document_info)
+                    for doc_id, doc_data in namespace_data.items():
+                        if isinstance(doc_data, dict) and (
+                            "summary" in doc_data or "status" in doc_data or "chunk_count" in doc_data
+                        ):
+                            document_info = {
+                                "id": doc_id,
+                                "name": doc_data.get("name", doc_id),
+                                "summary": doc_data.get("summary", "Keine Zusammenfassung verfügbar"),
+                                "chunk_count": doc_data.get("chunk_count", doc_data.get("chunks", 0)),
+                                "status": doc_data.get("status", "Unknown"),
+                                "date": doc_data.get("date", ""),
+                                "processing": doc_data.get("processing", False),
+                                "progress": doc_data.get("progress", 0),
+                                "path": doc_data.get("path", ""),
+                                "storageURL": doc_data.get("storageURL", "")
+                            }
+                            if "additional_info" in doc_data:
+                                document_info["additional_info"] = doc_data["additional_info"]
+                            documents.append(document_info)
                     return {
                         "status": "success",
                         "namespace": namespace,
@@ -726,4 +719,38 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
             return {
                 "status": "error",
                 "message": f"Error getting namespace summary: {str(e)}"
-            } 
+            }
+
+    def get_documents(self, namespace: str) -> str:
+        """
+        Get a simple string representation of all documents in a namespace for assessment purposes.
+        
+        Args:
+            namespace: Namespace identifier
+            
+        Returns:
+            String containing document overview
+        """
+        try:
+            summary_data = self.get_namespace_summary(namespace)
+            
+            if summary_data["status"] != "success" or summary_data["document_count"] == 0:
+                return "Keine Dokumente im Namespace verfügbar."
+            
+            documents_info = []
+            for doc in summary_data["documents"]:
+                doc_text = f"- Dokument: {doc.get('name', doc['id'])}\n"
+                doc_text += f"  ID: {doc['id']}\n"
+                doc_text += f"  Status: {doc.get('status', 'Unknown')}\n"
+                doc_text += f"  Chunks: {doc.get('chunk_count', 0)}\n"
+                doc_text += f"  Zusammenfassung: {doc['summary']}\n"
+                if doc.get('additional_info'):
+                    doc_text += f"  Zusätzliche Info: {doc['additional_info']}\n"
+                documents_info.append(doc_text)
+            
+            return f"Dokumente im Namespace '{namespace}' ({summary_data['document_count']} Dokumente):\n\n" + "\n".join(documents_info)
+            
+        except Exception as e:
+            return f"Fehler beim Abrufen der Dokumente: {str(e)}" 
+        
+    

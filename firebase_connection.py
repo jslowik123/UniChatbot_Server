@@ -167,9 +167,7 @@ class FirebaseConnection:
                 'keywords': combined_keywords,
                 'summary': summary,
             }
-            
-            if vector_ids is not None:
-                updated_data['vector_ids'] = vector_ids
+        
             
             # Update only changed fields
             for key, value in updated_data.items():
@@ -444,8 +442,10 @@ class FirebaseConnection:
         try:
             ref = self._db.reference(f'files/{project_name}/info')
             info = ref.get()
+            ref = self._db.reference(f'files/{project_name}/assessment')
+            assessment = ref.get()
             if info is not None:
-                return {'status': 'success', 'project_name': project_name, 'info': info}
+                return {'status': 'success', 'project_name': project_name, 'info': info, 'assessment': assessment}
             else:
                 return {'status': 'not_found', 'message': f'Keine Info für Projekt {project_name} gefunden.'}
         except Exception as e:

@@ -12,12 +12,13 @@ from agent_processor import AgentProcessor
 from agent_chatbot import get_bot, message_bot_agent
 from firebase_connection import FirebaseConnection
 from celery_app import test_task, celery
-from tasks import process_document
+from tasks import process_document, generate_assessment
 from redis import Redis
 import json
 import asyncio
 from celery.exceptions import Ignore
 from starlette.responses import JSONResponse
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -91,7 +92,7 @@ async def root():
     }
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...), abschnitt: str = Form(...)):
+async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...)):
     """
     Upload and process a PDF document asynchronously using AgentProcessor.
     
@@ -105,6 +106,8 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         Dict containing upload status and task information
     """
     try:
+        print(f"Upload request received: filename={file.filename}, namespace={namespace}, fileID={fileID}")
+        
         if not file.filename.lower().endswith('.pdf'):
             return {
                 "status": "error",
@@ -113,6 +116,8 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
             }
             
         content = await file.read()
+        print(f"File content read: {len(content)} bytes")
+        
         task = process_document.delay(content, namespace, fileID, file.filename)
         
         return {
@@ -122,10 +127,11 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
             "filename": file.filename
         }
     except Exception as e:
+        print(f"Upload error: {str(e)}")
         return {
             "status": "error", 
             "message": f"Error processing file: {str(e)}", 
-            "filename": file.filename
+            "filename": getattr(file, 'filename', 'unknown')
         }
 
 @app.post("/delete")
@@ -598,6 +604,90 @@ async def get_project_info(project_name: str):
         return firebase_result
     except Exception as e:
         return {"status": "error", "message": f"Fehler beim Abrufen der Projektinfo: {str(e)}"}
+
+
+def get_assessment_data(namespace: str, additional_info: str):
+    dokumente = agent_processor.get_documents(namespace)
+    chatbot_ziel = additional_info
+    print(chatbot_ziel)
+    client = OpenAI()
+    """
+    Get assessment data for a namespace.
+    """
+    print(dokumente)
+    system_prompt = """
+    Du bist ein Experte für Bildungstechnologie und Wissensanalyse. Ein Benutzer möchte einen Chatbot für Studierende erstellen. Dazu hat er Dokumente hochgeladen, die das Fachwissen des Chatbots bilden sollen. Außerdem hat er eine Zielbeschreibung beigefügt, was der Chatbot ungefähr können oder leisten soll.
+
+    Deine Aufgabe ist:
+    1. Lese dir die Dokumenten Übersicht durch.
+    2. Überprüfe ob die Dokumente ausreichen, um das Ziel zu erreichen.
+    3. Identifiziere Lücken oder fehlende Themenbereiche.
+    4. Gib konkrete Empfehlungen, welche weiteren Dokumente, Themen oder Inhalte hinzugefügt werden sollten, damit der Chatbot die gewünschte Aufgabe gut erfüllen kann.
+    5. Beachte der Chatbot soll rein informativ sein und zu den organisatorischen und generellen Fragen dinge beantworten.
+    6. Antworte in einem Structured Output Format, mit den drei Feldern: "Vorhandne", "Missing", "Tipps (Stichpunkte),", "Confidence".
+    7. in Confidence gibst du an zu wie viel prozent der chatbot die gewünschte Aufgabe erfüllen kann.
+
+    Denke dabei an:
+    - Vollständigkeit und Relevanz
+    - Unterschiedliche Perspektiven (z. B. theoretisch, praktisch, rechtlich)
+    - Verständlichkeit für Studierende
+
+    Antworte strukturiert.
+    Antworte in deutscher Sprache.
+    """
+
+    user_prompt = f"""
+    Ziel des Chatbots:
+    {chatbot_ziel}
+
+    Vorliegende Dokumente:
+    {dokumente}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",  # oder dein gewünschtes Modell
+        messages=[
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_prompt.strip()},
+        ],
+        temperature=0.3,
+        stream=False,
+    )
+
+    assessment_content = response.choices[0].message.content
+
+    # Speichere das Assessment in Firebase unter files/{namespace}/assessment
+    try:
+        agent_processor._firebase._db.reference(f'files/{namespace}/assessment').set(assessment_content)
+        firebase_status = "success"
+    except Exception as e:
+        firebase_status = f"error: {str(e)}"
+
+    return {"status": "success", "assessment": assessment_content, "firebase_status": firebase_status}
+      
+@app.post("/trigger_assessment")
+async def trigger_assessment(namespace: str = Form(...)):
+    """
+    Manually trigger assessment generation for a namespace.
+    
+    Args:
+        namespace: Namespace to generate assessment for
+        
+    Returns:
+        Dict containing task status
+    """
+    try:
+        task = generate_assessment.delay(namespace)
+        return {
+            "status": "success",
+            "message": f"Assessment generation triggered for namespace: {namespace}",
+            "task_id": task.id
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error triggering assessment: {str(e)}"
+        }
 
 if __name__ == "__main__":
     # Für lokale Entwicklung mit Reload-Funktionalität
