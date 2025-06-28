@@ -649,15 +649,45 @@ Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
         """
         try:
             index = self._pc.Index(self._index_name)
-            index.delete(namespace=namespace, delete_all=True)
-            return {
-                "status": "success",
-                "message": f"Namespace {namespace} deleted from Pinecone."
-            }
+            
+            # First check if namespace exists by trying to get stats
+            try:
+                stats = index.describe_index_stats()
+                namespaces = stats.get('namespaces', {})
+                
+                if namespace not in namespaces:
+                    return {
+                        "status": "success",
+                        "message": f"Namespace {namespace} does not exist - nothing to delete."
+                    }
+                
+                # If namespace exists, proceed with deletion
+                index.delete(namespace=namespace, delete_all=True)
+                return {
+                    "status": "success",
+                    "message": f"Namespace {namespace} deleted from Pinecone."
+                }
+                
+            except Exception as check_error:
+                # If we can't check namespace existence, try deletion anyway
+                # This handles cases where the index might exist but be empty
+                index.delete(namespace=namespace, delete_all=True)
+                return {
+                    "status": "success",
+                    "message": f"Namespace {namespace} deletion attempted (existence check failed but deletion succeeded)."
+                }
+                
         except Exception as e:
+            error_message = str(e)
+            # Handle 404 errors more gracefully
+            if "404" in error_message or "Not Found" in error_message:
+                return {
+                    "status": "success",
+                    "message": f"Namespace {namespace} does not exist - nothing to delete."
+                }
             return {
                 "status": "error",
-                "message": f"Error deleting namespace from Pinecone: {str(e)}"
+                "message": f"Error deleting namespace from Pinecone: {error_message}"
             }
 
     def get_namespace_summary(self, namespace: str):

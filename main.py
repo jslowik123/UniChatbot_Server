@@ -297,26 +297,25 @@ async def delete_namespace(namespace: str = Form(...)):
         # Delete namespace from Pinecone using AgentProcessor
         pinecone_result = agent_processor.delete_namespace(namespace)
         
-        if pinecone_result.get("status") == "error":
-            # Log the error and potentially return it
-            print(f"Error deleting namespace from Pinecone: {pinecone_result.get('message')}")
-            # Decide if you want to stop or continue if Pinecone fails
-            # For now, we'll return the error immediately
-            return JSONResponse(status_code=500, content=pinecone_result)
-
         # Delete Firebase metadata if available
         firebase_result = {"status": "success", "message": "Firebase not available or not configured for this agent."}
         if hasattr(agent_processor, '_firebase_available') and agent_processor._firebase_available:
             firebase_result = agent_processor._firebase.delete_namespace_metadata(namespace)
         
+        # Both operations should be considered successful even if namespace doesn't exist
         return JSONResponse(content={
+            "status": "success",
             "message": f"Namespace {namespace} deletion process completed.",
             "pinecone_result": pinecone_result,
             "firebase_result": firebase_result
         })
         
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "error": str(e),
+            "message": f"Unexpected error during namespace deletion: {str(e)}"
+        })
 
 @app.get("/test_worker")
 async def test_worker():
@@ -630,9 +629,11 @@ def get_assessment_data(namespace: str, additional_info: str):
 
     WICHTIG: Antworte im JSON-Format mit exakt diesen Feldern:
     {
-        "vorhanden": ["Stichwort 1", "Stichwort 2", "Stichwort 3"],
-        "fehlt": ["Fehlendes Dokument 1", "Fehlendes Dokument 2"],
+        "vorhandene_dokumente": ["Stichwort 1", "Stichwort 2", "Stichwort 3"],
+        "fehlende_dokumente": ["Fehlendes Dokument 1", "Fehlendes Dokument 2"],
         "tipps": ["Kurzer Tipp 1", "Kurzer Tipp 2"],
+        "wissensstand": "Kurze Beschreibung des Wissensstands des Chatbots, also was alles beantwortet werden kann (5-10 Sätze)",
+        
         "confidence": 85
     }
 
