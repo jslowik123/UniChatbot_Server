@@ -278,11 +278,11 @@ class AgentProcessor:
         
         # PDF Retriever Tool für CrewAI
         @tool("Document Overview Tool")
-        def document_overview_tool(namespace) -> str:
+        def document_overview_tool() -> str:
             """Zeigt eine Übersicht aller verfügbaren Dokumente im aktuellen Namespace mit deren Zusammenfassungen und IDs."""
             try:
-                summary_data = self.get_namespace_summary(namespace)
-                print(summary_data)
+                summary_data = self.get_namespace_summary(namespace)  # namespace from closure
+                print(f"📋 Document Overview für namespace: {namespace}")
                 if summary_data["status"] != "success":
                     return f"FEHLER: {summary_data.get('message', 'Unbekannter Fehler beim Abrufen der Dokumentübersicht')}"
                 
@@ -325,11 +325,13 @@ class AgentProcessor:
                 document_ids: Optional - Komma-getrennte Liste von Dokument-IDs um die Suche zu filtern (z.B. 'doc1,doc2')
             """
             try:
+                print(f"🔍 PDF Search für Query: '{query}' in namespace: {namespace}")
+                
                 # Parse document IDs filter if provided
                 target_doc_ids = None
                 if document_ids.strip():
                     target_doc_ids = [doc_id.strip() for doc_id in document_ids.split(',') if doc_id.strip()]
-                    print(f"🔍 Suche beschränkt auf Dokumente: {target_doc_ids}")
+                    print(f"🎯 Suche beschränkt auf Dokumente: {target_doc_ids}")
                 
                 docs = compression_retriever.invoke(query)
                 
@@ -368,10 +370,13 @@ class AgentProcessor:
                 if target_doc_ids:
                     result_text += f"\n[SYSTEM_INFO] FILTERED_BY_DOC_IDS: {target_doc_ids}"
                 
+                print(f"✅ PDF Search erfolgreich: {len(results)} Ergebnisse, Dokument-IDs: {doc_ids_list}")
                 return result_text
                 
             except Exception as e:
-                return f"FEHLER BEIM DURCHSUCHEN: {str(e)}"
+                error_msg = f"FEHLER BEIM DURCHSUCHEN: {str(e)}"
+                print(f"❌ PDF Search Fehler: {error_msg}")
+                return error_msg
         
         # Agent definieren
         researcher = Agent(
@@ -388,7 +393,7 @@ class AgentProcessor:
             2. PDF Search Tool - um in spezifischen oder allen Dokumenten zu suchen""",
             llm=self._llm,
             tools=[document_overview_tool, pdf_search_tool],
-            verbose=True,
+            verbose=False,  # Disable verbose to avoid parsing issues
             allow_delegation=False
         )
         
@@ -432,31 +437,24 @@ BISHERIGE UNTERHALTUNG:
 
 AKTUELLE NACHRICHT: {question}
 
+WICHTIG - TOOL USAGE REGELN:
+Du MUSST deine Tools verwenden für folgende Fragen:
+• Jede Frage nach "welche Dokumente", "verfügbare Dokumente" oder ähnliches → Document Overview Tool
+• Jede spezifische Frage zu Studiengängen, Modulen, Kursen → PDF Search Tool  
+• Fragen zu Prüfungen, Regelungen, Terminen → PDF Search Tool
+• Wenn nach spezifischen Informationen aus Dokumenten gefragt wird → PDF Search Tool
+
 WIE DU ANTWORTEN SOLLST:
 • Sei natürlich und gesprächig - wie ein echter Studienbuddy
-• Wenn die Frage mit verfügbaren Dokumenten beantwortet werden kann, nutze deine Tools intelligent
-• ABER: Du musst nicht immer suchen! Oft reicht dein Allgemeinwissen völlig aus
-• Bei Small Talk, allgemeinen Fragen oder Unterhaltung - einfach normal antworten
+• Für dokumentenbasierte Fragen: VERWENDE IMMER zuerst die entsprechenden Tools
+• Bei Small Talk oder allgemeinen Fragen kannst du ohne Tools antworten
 • Sei locker, freundlich und authentisch
 • Beziehe dich auf vorherige Nachrichten wenn relevant
 
-WANN UND WIE SUCHST DU IN DOKUMENTEN?
-• Bei spezifischen Fragen zu Studiengängen, Kursen, Prüfungen
-• Bei Fragen zu universitären Regelungen oder Verfahren  
-• Wenn explizit nach Dokumenteninhalten gefragt wird
-• NICHT bei: Smalltalk, allgemeinen Fragen, persönlichen Gesprächen
-
-INTELLIGENTER TOOL-WORKFLOW:
-1. Für dokumentenbasierte Fragen: Nutze ZUERST das "Document Overview Tool" um zu sehen welche Dokumente verfügbar sind
-2. Basierend auf der Übersicht: Entscheide welche Dokumente relevant sein könnten
-3. Nutze dann das "PDF Search Tool" mit spezifischen document_ids für präzise Suchen
-4. Alternativ: Suche in allen Dokumenten wenn du unsicher bist welche relevant sind
-
-WICHTIG - UMGANG MIT TOOL-ERGEBNISSEN:
-• Wenn das PDF Search Tool "KEINE DOKUMENTE GEFUNDEN" zurückgibt: Antworte mit deinem Allgemeinwissen, aber sage klar dass keine spezifischen Dokumente verfügbar sind
-• Wenn das Tool "FEHLER" zurückgibt: Erkläre das Problem und antworte trotzdem hilfreich
-• NIEMALS Quellen oder Dokument-IDs erfinden wenn das Tool keine liefert!
-• Sei ehrlich wenn keine Dokumente gefunden wurden
+TOOL-WORKFLOW (BEFOLGE DAS GENAU):
+1. WENN die Frage nach Dokumenten fragt → Document Overview Tool aufrufen
+2. WENN nach spezifischen Inhalten gefragt wird → PDF Search Tool aufrufen
+3. ERST DANN antworte basierend auf den Tool-Ergebnissen
 
 ANTWORTFORMAT - WICHTIG:
 Deine Antwort muss IMMER in diesem JSON-Format sein (ohne Markdown-Blöcke):
@@ -474,7 +472,8 @@ WICHTIG FÜR DOCUMENT_IDS:
 - Wenn du das Tool nicht verwendest, lass document_ids leer: []
 - Verwende nur die echten document_ids aus den Suchergebnissen, erfinde keine!
 - Gib nur die document_ids aus, die du auch wirklich verwendet hast um die Antwort zu erstellen!
-Denk dran: Sei ein normaler Gesprächspartner, nicht ein Suchroboter!
+
+WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
 """
             
             task = Task(
