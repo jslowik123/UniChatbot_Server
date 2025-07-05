@@ -212,6 +212,35 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
     Returns:
         Dict containing structured response with answer, sources, confidence, etc.
     """
+    # Input validation
+    if not user_input or not isinstance(user_input, str) or not user_input.strip():
+        return {
+            "status": "error",
+            "message": "User input must be a non-empty string",
+            "structured_response": {
+                "answer": "Ungültige Eingabe",
+                "document_ids": [],
+                "sources": [],
+                "confidence_score": 0.0,
+                "context_used": False,
+                "additional_info": "Leere oder ungültige Benutzereingabe"
+            }
+        }
+    
+    if not namespace or not isinstance(namespace, str) or not namespace.strip():
+        return {
+            "status": "error",
+            "message": "Namespace must be a non-empty string",
+            "structured_response": {
+                "answer": "Ungültiger Namespace",
+                "document_ids": [],
+                "sources": [],
+                "confidence_score": 0.0,
+                "context_used": False,
+                "additional_info": "Leerer oder ungültiger Namespace"
+            }
+        }
+    
     if not chat_state.agent_chatbot:
         return {
             "status": "error",
@@ -233,14 +262,31 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
         
         history = chat_state.chat_history[namespace]
         
+        # Add comprehensive logging
+        print(f"SEND_MESSAGE DEBUG - User input: {user_input[:100]}...")
+        print(f"SEND_MESSAGE DEBUG - Namespace: {namespace}")
+        print(f"SEND_MESSAGE DEBUG - History length: {len(history)}")
+        
         # Use the structured message_bot function
         structured_response = message_bot_agent(
             user_input, namespace, history
         )
         
+        # Validate response structure
+        if not isinstance(structured_response, dict):
+            print(f"WARNING: Unexpected response type: {type(structured_response)}")
+            structured_response = {
+                "answer": str(structured_response),
+                "document_ids": [],
+                "sources": [],
+                "confidence_score": 0.5,
+                "context_used": False,
+                "additional_info": "Response was not in expected format"
+            }
+        
         # Update chat history
         chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
-        chat_state.chat_history[namespace].append({"role": "assistant", "content": structured_response["answer"]})
+        chat_state.chat_history[namespace].append({"role": "assistant", "content": structured_response.get("answer", "No answer")})
         
         # Keep only last 20 messages to prevent memory overflow
         if len(chat_state.chat_history[namespace]) > 20:
@@ -250,6 +296,8 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
         
     except Exception as e:
         print(f"Error in send_message_structured: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
                 "answer": f"Fehler: {str(e)}",
                 "document_ids": [],

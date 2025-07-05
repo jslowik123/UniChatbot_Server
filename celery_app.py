@@ -24,9 +24,9 @@ celery.conf.update(
     task_serializer='json',
     result_serializer='json',
     accept_content=['json'],
-    # Task timeout settings
-    task_soft_time_limit=300,  # 5 minutes soft limit
-    task_time_limit=600,       # 10 minutes hard limit
+    # Task timeout settings - increased for larger chunks
+    task_soft_time_limit=900,  # 15 minutes soft limit (increased from 5 min)
+    task_time_limit=1800,      # 30 minutes hard limit (increased from 10 min)
     # Result backend settings
     result_expires=3600,       # Results expire after 1 hour
     # Worker settings

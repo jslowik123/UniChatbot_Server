@@ -127,17 +127,24 @@ def _validate_inputs(user_input, context, knowledge, chat_history):
     Returns:
         tuple: Validated and sanitized inputs
     """
+    # User input validation
     if not user_input or not isinstance(user_input, str):
         raise ValueError("User input must be a non-empty string")
     
+    # Chat history validation
     if not isinstance(chat_history, list):
         chat_history = []
         
-    if not context or not isinstance(context, str):
+    # Context validation - use 'is None' instead of 'not context' to avoid overwriting valid empty strings
+    if context is None or not isinstance(context, str):
         context = ""
-
-    if not knowledge or not isinstance(knowledge, str):
+    
+    # Knowledge validation - use 'is None' instead of 'not knowledge' to avoid overwriting valid empty strings
+    if knowledge is None or not isinstance(knowledge, str):
         knowledge = ""
+    
+    # Add logging for debugging
+    print(f"VALIDATION DEBUG - Context length: {len(context) if context else 0}, Knowledge length: {len(knowledge) if knowledge else 0}")
         
     return user_input.strip(), context, knowledge, chat_history
 
@@ -152,16 +159,40 @@ def _format_chat_history(chat_history):
     Returns:
         list: Formatted chat history for LangChain
     """
-    formatted_history = []
-    for msg in chat_history:
-        if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
-            continue
-            
-        if msg["role"] == "user":
-            formatted_history.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            formatted_history.append(AIMessage(content=msg["content"]))
+    if not isinstance(chat_history, list):
+        print(f"⚠️  Chat history is not a list: {type(chat_history)}")
+        return []
     
+    formatted_history = []
+    for i, msg in enumerate(chat_history):
+        try:
+            if not isinstance(msg, dict):
+                print(f"⚠️  Chat message {i} is not a dict: {type(msg)}")
+                continue
+            
+            if "role" not in msg or "content" not in msg:
+                print(f"⚠️  Chat message {i} missing required fields: {msg.keys()}")
+                continue
+            
+            role = msg["role"]
+            content = msg["content"]
+            
+            if not isinstance(role, str) or not isinstance(content, str):
+                print(f"⚠️  Chat message {i} has invalid types: role={type(role)}, content={type(content)}")
+                continue
+            
+            if role == "user":
+                formatted_history.append(HumanMessage(content=content))
+            elif role == "assistant":
+                formatted_history.append(AIMessage(content=content))
+            else:
+                print(f"⚠️  Chat message {i} has unknown role: {role}")
+                
+        except Exception as format_error:
+            print(f"❌ Error formatting chat message {i}: {str(format_error)}")
+            continue
+    
+    print(f"CHAT HISTORY DEBUG - Formatted {len(formatted_history)} messages from {len(chat_history)} input messages")
     return formatted_history
 
 

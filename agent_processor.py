@@ -22,8 +22,8 @@ load_dotenv()
 
 # Constants
 EMBEDDING_MODEL = "text-embedding-ada-002"
-DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_CHUNK_SIZE = 2000
+DEFAULT_CHUNK_OVERLAP = 300
 DEFAULT_TEMPERATURE = 0.7
 GPT_MODEL = "gpt-4.1-mini"
 
@@ -222,9 +222,29 @@ class AgentProcessor:
                 for i in range(len(processed_pdf["chunks"]))
             ] + [{"pdf_id": fileID, "document_id": fileID, "type": "summary"}]
             
-            # Add texts to vectorstore und speichere die IDs
+            # Add texts to vectorstore with retry mechanism
             ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"]
-            vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+            
+            print(f"📤 Indexing {len(texts)} texts for document {fileID}")
+            print(f"📊 Text lengths: {[len(text) for text in texts[:5]]}...")  # Show first 5 lengths
+            
+            # Retry mechanism for Pinecone upload
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+                    print(f"✅ Successfully indexed document {fileID} on attempt {attempt + 1}")
+                    break
+                except Exception as upload_error:
+                    print(f"❌ Attempt {attempt + 1} failed: {str(upload_error)}")
+                    if attempt == max_retries - 1:
+                        raise upload_error
+                    
+                    # Wait before retry (exponential backoff)
+                    import time
+                    wait_time = 2 ** attempt
+                    print(f"⏳ Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
             # Speichere die IDs in Firebase
             if self._firebase_available:
                 self._firebase.append_metadata(
@@ -327,42 +347,97 @@ class AgentProcessor:
             try:
                 print(f"🔍 PDF Search für Query: '{query}' in namespace: {namespace}")
                 
+                # Input validation
+                if not query or not isinstance(query, str) or not query.strip():
+                    return "FEHLER: Suchanfrage ist leer oder ungültig."
+                
                 # Parse document IDs filter if provided
                 target_doc_ids = None
-                if document_ids.strip():
+                if document_ids and document_ids.strip():
                     target_doc_ids = [doc_id.strip() for doc_id in document_ids.split(',') if doc_id.strip()]
                     print(f"🎯 Suche beschränkt auf Dokumente: {target_doc_ids}")
                 
-                docs = compression_retriever.invoke(query)
+                # Perform search with error handling
+                docs = None
+                try:
+                    docs = compression_retriever.invoke(query)
+                except Exception as search_error:
+                    print(f"❌ Fehler beim Pinecone-Abruf: {str(search_error)}")
+                    return f"FEHLER BEI PINECONE-SUCHE: {str(search_error)}"
+                
+                # Validate Pinecone response structure
+                if docs is None:
+                    return "FEHLER: Pinecone-Antwort ist None - möglicherweise Verbindungsproblem."
+                
+                if not isinstance(docs, list):
+                    print(f"⚠️  Unerwarteter Pinecone-Response-Typ: {type(docs)}")
+                    return f"FEHLER: Unerwarteter Response-Typ von Pinecone: {type(docs)}"
                 
                 if not docs:
                     return "KEINE DOKUMENTE GEFUNDEN: Es wurden keine relevanten Dokumente für diese Anfrage gefunden. Der Namespace könnte leer sein oder die Anfrage passt zu keinem verfügbaren Inhalt."
+                
+                print(f"📄 Pinecone lieferte {len(docs)} Dokumente")
                 
                 # Filter by document IDs if specified
                 if target_doc_ids:
                     filtered_docs = []
                     for doc in docs:
-                        doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
-                        if doc_id in target_doc_ids:
-                            filtered_docs.append(doc)
+                        try:
+                            # Safe metadata extraction with error handling
+                            if not hasattr(doc, 'metadata') or not isinstance(doc.metadata, dict):
+                                print(f"⚠️  Dokument ohne gültige Metadata: {doc}")
+                                continue
+                            
+                            doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
+                            if doc_id in target_doc_ids:
+                                filtered_docs.append(doc)
+                        except Exception as filter_error:
+                            print(f"❌ Fehler beim Filtern von Dokument: {str(filter_error)}")
+                            continue
+                    
                     docs = filtered_docs
                     
                     if not docs:
                         return f"KEINE DOKUMENTE IN GEFILTERTEN IDs: Es wurden keine relevanten Dokumente in den spezifizierten Dokument-IDs {target_doc_ids} gefunden."
                 
+                # Extract content with comprehensive error handling
                 results = []
                 found_doc_ids = set()
-                for doc in docs:
-                    # Extract metadata for structured response
-                    doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
-                    found_doc_ids.add(doc_id)
-                    content = doc.page_content
-                    results.append(f"[DOC_ID: {doc_id}] {content}")
+                for i, doc in enumerate(docs):
+                    try:
+                        # Validate document structure
+                        if not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
+                            print(f"⚠️  Dokument {i} hat ungültige Struktur: {doc}")
+                            continue
+                        
+                        # Safe metadata extraction
+                        if not isinstance(doc.metadata, dict):
+                            print(f"⚠️  Dokument {i} hat ungültige Metadata: {doc.metadata}")
+                            doc_id = f"unknown_{i}"
+                        else:
+                            doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', f'unknown_{i}'))
+                        
+                        # Safe content extraction
+                        content = getattr(doc, 'page_content', '')
+                        if not isinstance(content, str):
+                            print(f"⚠️  Dokument {i} hat ungültigen Content-Typ: {type(content)}")
+                            content = str(content)
+                        
+                        if not content.strip():
+                            print(f"⚠️  Dokument {i} hat leeren Content")
+                            continue
+                        
+                        found_doc_ids.add(doc_id)
+                        results.append(f"[DOC_ID: {doc_id}] {content}")
+                        
+                    except Exception as extract_error:
+                        print(f"❌ Fehler beim Extrahieren von Dokument {i}: {str(extract_error)}")
+                        continue
                 
                 if not results:
-                    return "KEINE RELEVANTEN INHALTE: Dokumente wurden gefunden, aber sie enthalten keine relevanten Informationen für diese Anfrage."
+                    return "KEINE RELEVANTEN INHALTE: Dokumente wurden gefunden, aber sie enthalten keine relevanten Informationen für diese Anfrage oder konnten nicht verarbeitet werden."
                 
-                # Add document IDs info for the agent to use
+                # Build result with comprehensive logging
                 doc_ids_list = list(found_doc_ids)
                 result_text = "\n\n".join(results)
                 result_text += f"\n\n[SYSTEM_INFO] FOUND_DOCUMENT_IDS: {doc_ids_list}"
@@ -371,11 +446,15 @@ class AgentProcessor:
                     result_text += f"\n[SYSTEM_INFO] FILTERED_BY_DOC_IDS: {target_doc_ids}"
                 
                 print(f"✅ PDF Search erfolgreich: {len(results)} Ergebnisse, Dokument-IDs: {doc_ids_list}")
+                print(f"📊 Context-Länge: {len(result_text)} Zeichen")
+                
                 return result_text
                 
             except Exception as e:
                 error_msg = f"FEHLER BEIM DURCHSUCHEN: {str(e)}"
                 print(f"❌ PDF Search Fehler: {error_msg}")
+                import traceback
+                traceback.print_exc()
                 return error_msg
         
         # Agent definieren
@@ -413,20 +492,60 @@ class AgentProcessor:
             Structured response containing answer and metadata
         """
         try:
+            # Input validation
+            if not question or not isinstance(question, str) or not question.strip():
+                return {
+                    "answer": "Ungültige Frage",
+                    "document_ids": [],
+                    "sources": [],
+                    "confidence_score": 0.0,
+                    "context_used": False,
+                    "additional_info": "Leere oder ungültige Frage"
+                }
+            
+            if not namespace or not isinstance(namespace, str) or not namespace.strip():
+                return {
+                    "answer": "Ungültiger Namespace",
+                    "document_ids": [],
+                    "sources": [],
+                    "confidence_score": 0.0,
+                    "context_used": False,
+                    "additional_info": "Leerer oder ungültiger Namespace"
+                }
+            
+            print(f"🤖 AGENT PROCESSOR - Question: {question[:100]}...")
+            print(f"🤖 AGENT PROCESSOR - Namespace: {namespace}")
+            
             researcher, _ = self.setup_agent(namespace)
             
-            # Prepare chat history context
+            # Prepare chat history context with validation
             chat_context = ""
             has_history = bool(chat_history and len(chat_history) > 0)
             
             if has_history:
+                print(f"🤖 AGENT PROCESSOR - Processing {len(chat_history)} chat history messages")
                 recent_messages = chat_history[-6:]  # Last 6 messages for context
                 context_parts = []
-                for msg in recent_messages:
-                    role = msg.get('role', 'unknown')
-                    content = msg.get('content', '')
-                    context_parts.append(f"{role.upper()}: {content}")
+                for i, msg in enumerate(recent_messages):
+                    try:
+                        if not isinstance(msg, dict):
+                            print(f"⚠️  Chat message {i} ist kein Dict: {type(msg)}")
+                            continue
+                        
+                        role = msg.get('role', 'unknown')
+                        content = msg.get('content', '')
+                        
+                        if not isinstance(role, str) or not isinstance(content, str):
+                            print(f"⚠️  Chat message {i} hat ungültigen Typ: role={type(role)}, content={type(content)}")
+                            continue
+                        
+                        context_parts.append(f"{role.upper()}: {content}")
+                    except Exception as msg_error:
+                        print(f"❌ Fehler beim Verarbeiten von Chat-Message {i}: {str(msg_error)}")
+                        continue
+                
                 chat_context = "\n".join(context_parts)
+                print(f"🤖 AGENT PROCESSOR - Chat context length: {len(chat_context)} chars")
             
             # Create structured task description
             task_description = f"""
@@ -491,28 +610,48 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             result = crew.kickoff()
             result_str = str(result)
             
-            # Try to parse the JSON response
+            # Try to parse the JSON response with comprehensive error handling
             try:
+                print(f"🤖 AGENT PROCESSOR - Raw result length: {len(result_str)} chars")
+                print(f"🤖 AGENT PROCESSOR - Raw result preview: {result_str[:200]}...")
+                
                 # Extract JSON from the response
                 json_start = result_str.find('{')
                 json_end = result_str.rfind('}') + 1
                 
                 if json_start != -1 and json_end != -1:
                     json_str = result_str[json_start:json_end]
-                    parsed_response = json.loads(json_str)
+                    print(f"🤖 AGENT PROCESSOR - Extracted JSON: {json_str[:300]}...")
                     
-                    # Validate and structure the response
-                    structured_response = {
-                        "answer": parsed_response.get("answer", result_str),
-                        "document_ids": parsed_response.get("document_ids", []),
-                        "sources": parsed_response.get("sources", []),
-                        "confidence_score": float(parsed_response.get("confidence_score", 0.8)),
-                        "context_used": bool(parsed_response.get("context_used", has_history)),
-                        "additional_info": parsed_response.get("additional_info")
-                    }
-                    
-                    return structured_response
+                    try:
+                        parsed_response = json.loads(json_str)
+                        print(f"🤖 AGENT PROCESSOR - JSON parsing successful")
+                        
+                        # Validate parsed response structure
+                        if not isinstance(parsed_response, dict):
+                            print(f"⚠️  Parsed response is not a dict: {type(parsed_response)}")
+                            raise ValueError("Parsed response is not a dictionary")
+                        
+                        # Validate and structure the response with safe extraction
+                        structured_response = {
+                            "answer": str(parsed_response.get("answer", result_str)),
+                            "document_ids": parsed_response.get("document_ids", []) if isinstance(parsed_response.get("document_ids"), list) else [],
+                            "sources": parsed_response.get("sources", []) if isinstance(parsed_response.get("sources"), list) else [],
+                            "confidence_score": float(parsed_response.get("confidence_score", 0.8)) if isinstance(parsed_response.get("confidence_score"), (int, float)) else 0.8,
+                            "context_used": bool(parsed_response.get("context_used", has_history)),
+                            "additional_info": parsed_response.get("additional_info")
+                        }
+                        
+                        print(f"🤖 AGENT PROCESSOR - Structured response created successfully")
+                        return structured_response
+                        
+                    except json.JSONDecodeError as json_error:
+                        print(f"❌ JSON parsing error: {str(json_error)}")
+                        print(f"❌ Problematic JSON: {json_str}")
+                        raise json_error
+                        
                 else:
+                    print(f"⚠️  No JSON found in response")
                     # Fallback if JSON parsing fails
                     return {
                         "answer": result_str,
@@ -520,10 +659,11 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                         "sources": [],
                         "confidence_score": 0.7,
                         "context_used": has_history,
-                        "additional_info": "Antwort konnte nicht als strukturiertes JSON geparst werden"
+                        "additional_info": "Antwort konnte nicht als strukturiertes JSON geparst werden - keine JSON-Struktur gefunden"
                     }
                     
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as json_error:
+                print(f"❌ JSON parsing completely failed: {str(json_error)}")
                 # Fallback if JSON parsing fails
                 return {
                     "answer": result_str,
@@ -531,10 +671,23 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                     "sources": [],
                     "confidence_score": 0.7,
                     "context_used": has_history,
-                    "additional_info": "JSON-Parsing fehlgeschlagen, Rohtext-Antwort bereitgestellt"
+                    "additional_info": f"JSON-Parsing fehlgeschlagen: {str(json_error)}"
+                }
+            except Exception as parse_error:
+                print(f"❌ Unexpected parsing error: {str(parse_error)}")
+                return {
+                    "answer": result_str,
+                    "document_ids": [],
+                    "sources": [],
+                    "confidence_score": 0.7,
+                    "context_used": has_history,
+                    "additional_info": f"Unerwarteter Parsing-Fehler: {str(parse_error)}"
                 }
             
         except Exception as e:
+            print(f"❌ AGENT PROCESSOR - Unerwarteter Fehler: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {
                 "answer": f"Fehler beim Beantworten der Frage: {str(e)}",
                 "document_ids": [],

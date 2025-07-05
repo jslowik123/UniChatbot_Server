@@ -10,7 +10,7 @@ from pinecone_connection import PineconeCon
 from firebase_connection import FirebaseConnection
 
 # Constants
-DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_SIZE = 2000
 DEFAULT_MODEL = "gpt-4.1-nano"
 DEFAULT_TEMPERATURE = 0.3
 EMBEDDING_MODEL = "text-embedding-3-small"
