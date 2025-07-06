@@ -374,7 +374,7 @@ class AgentProcessor:
                     return f"FEHLER: Unerwarteter Response-Typ von Pinecone: {type(docs)}"
                 
                 if not docs:
-                    return "KEINE DOKUMENTE GEFUNDEN: Es wurden keine relevanten Dokumente für diese Anfrage gefunden. Der Namespace könnte leer sein oder die Anfrage passt zu keinem verfügbaren Inhalt."
+                    return "KEINE DOKUMENTE GEFUNDEN: Keine relevanten Dokumente gefunden."
                 
                 print(f"📄 Pinecone lieferte {len(docs)} Dokumente")
                 
@@ -398,7 +398,7 @@ class AgentProcessor:
                     docs = filtered_docs
                     
                     if not docs:
-                        return f"KEINE DOKUMENTE IN GEFILTERTEN IDs: Es wurden keine relevanten Dokumente in den spezifizierten Dokument-IDs {target_doc_ids} gefunden."
+                        return f"KEINE DOKUMENTE IN GEFILTERTEN IDs: Keine relevanten Dokumente in {target_doc_ids} gefunden."
                 
                 # Extract content with comprehensive error handling
                 results = []
@@ -435,7 +435,7 @@ class AgentProcessor:
                         continue
                 
                 if not results:
-                    return "KEINE RELEVANTEN INHALTE: Dokumente wurden gefunden, aber sie enthalten keine relevanten Informationen für diese Anfrage oder konnten nicht verarbeitet werden."
+                    return "KEINE RELEVANTEN INHALTE: Dokumente gefunden, aber keine relevanten Informationen."
                 
                 # Build result with comprehensive logging
                 doc_ids_list = list(found_doc_ids)
@@ -459,16 +459,18 @@ class AgentProcessor:
         
         # Agent definieren
         researcher = Agent(
-            role="Hilfsbereit Studienbuddy",
-            goal="Sei ein natürlicher, freundlicher Gesprächspartner für Studierende. Führe normale Unterhaltungen und nutze Dokumente nur wenn sie wirklich relevant sind.",
-            backstory="""Du bist ein entspannter, hilfsbereiter Studienbuddy der Deutsch spricht. Du kannst über alles reden - 
-            Studienfragen, alltägliche Dinge, Probleme oder einfach plaudern. Wenn jemand spezifische Fragen hat, die in 
-            den verfügbaren Dokumenten beantwortet werden können, dann suchst du gerne nach - aber das ist nicht dein 
-            Hauptfokus. Du bist erstmal ein normaler Gesprächspartner, der hilft wo er kann. Sei locker, freundlich und 
-            authentisch. Du musst nicht immer in Dokumenten suchen - manchmal reicht dein Allgemeinwissen völlig aus.
+            role="Studienberater",
+            goal="Hilf Studierenden bei ihren Fragen. Wenn etwas unklar ist, frage kurz nach.",
+            backstory="""Du bist ein freundlicher Studienberater. Antworte direkt auf Fragen und frage nur bei wirklich nötigen Informationen kurz nach.
+            
+            VERHALTEN:
+            - Antworte direkt mit den verfügbaren Informationen
+            - Wenn etwas unklar ist: Eine kurze, einfache Nachfrage
+            - Beispiel: "Welcher Studiengang?" oder "Welches Semester?"
+            - Arbeite mit dem was du hast, auch wenn es nicht perfekt ist
             
             Du hast zwei Tools zur Verfügung:
-            1. Document Overview Tool - um zu sehen welche Dokumente verfügbar sind
+            1. Document Overview Tool - um zu sehen welche Dokumente verfügbar sind  
             2. PDF Search Tool - um in spezifischen oder allen Dokumenten zu suchen""",
             llm=self._llm,
             tools=[document_overview_tool, pdf_search_tool],
@@ -563,17 +565,23 @@ Du MUSST deine Tools verwenden für folgende Fragen:
 • Fragen zu Prüfungen, Regelungen, Terminen → PDF Search Tool
 • Wenn nach spezifischen Informationen aus Dokumenten gefragt wird → PDF Search Tool
 
+WENN ETWAS UNKLAR IST:
+• Frage kurz nach: "Welcher Studiengang?" oder "Welches Semester?"
+• Arbeite mit dem was du hast, auch wenn es nicht perfekt ist
+• Nur bei wirklich nötigen Informationen nachfragen
+
 WIE DU ANTWORTEN SOLLST:
-• Sei natürlich und gesprächig - wie ein echter Studienbuddy
+• Sei natürlich und hilfsbereit - wie ein erfahrener Studienberater
 • Für dokumentenbasierte Fragen: VERWENDE IMMER zuerst die entsprechenden Tools
-• Bei Small Talk oder allgemeinen Fragen kannst du ohne Tools antworten
-• Sei locker, freundlich und authentisch
+• Bei unklaren Ergebnissen: Stelle SOFORT präzise Rückfragen
+• NIEMALS über Kontext oder Suche sprechen
 • Beziehe dich auf vorherige Nachrichten wenn relevant
 
 TOOL-WORKFLOW (BEFOLGE DAS GENAU):
 1. WENN die Frage nach Dokumenten fragt → Document Overview Tool aufrufen
 2. WENN nach spezifischen Inhalten gefragt wird → PDF Search Tool aufrufen
-3. ERST DANN antworte basierend auf den Tool-Ergebnissen
+3. WENN Ergebnisse unklar/unvollständig sind → Präzise Rückfragen stellen
+4. ERST DANN antworte basierend auf den Tool-Ergebnissen
 
 ANTWORTFORMAT - WICHTIG:
 Deine Antwort muss IMMER in diesem JSON-Format sein (ohne Markdown-Blöcke):
