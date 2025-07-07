@@ -23,7 +23,7 @@ load_dotenv()
 # Constants
 EMBEDDING_MODEL = "text-embedding-ada-002"
 DEFAULT_CHUNK_SIZE = 2000
-DEFAULT_CHUNK_OVERLAP = 300
+DEFAULT_CHUNK_OVERLAP = 500  # Reduced to 100-200 token range (roughly 150 characters)
 DEFAULT_TEMPERATURE = 0.7
 GPT_MODEL = "gpt-4.1-mini"
 
@@ -170,6 +170,168 @@ class AgentProcessor:
         
         self._vectorstores[namespace] = vectorstore
         return vectorstore
+
+    def get_adjacent_chunks(self, namespace: str, chunk_id: str) -> Dict[str, str]:
+        """
+        Retrieve adjacent chunks (previous and next) for a given chunk ID.
+        
+        Args:
+            namespace: Namespace to search in
+            chunk_id: ID of the main chunk (format: fileID_chunk_X)
+            
+        Returns:
+            Dict containing previous, current, and next chunk content
+        """
+        try:
+            index = self._pc.Index(self._index_name)
+            
+            # Parse chunk ID to get document ID and chunk number
+            if "_chunk_" not in chunk_id:
+                return {"current": None, "previous": None, "next": None}
+            
+            parts = chunk_id.split("_chunk_")
+            if len(parts) != 2:
+                return {"current": None, "previous": None, "next": None}
+            
+            file_id = parts[0]
+            try:
+                chunk_num = int(parts[1])
+            except ValueError:
+                return {"current": None, "previous": None, "next": None}
+            
+            # Construct IDs for adjacent chunks
+            prev_id = f"{file_id}_chunk_{chunk_num - 1}" if chunk_num > 0 else None
+            next_id = f"{file_id}_chunk_{chunk_num + 1}"
+            
+            # Fetch chunks from Pinecone
+            result = {"current": None, "previous": None, "next": None}
+            
+            # Get current chunk
+            try:
+                current_response = index.fetch(ids=[chunk_id], namespace=namespace)
+                if chunk_id in current_response.get('vectors', {}):
+                    current_metadata = current_response['vectors'][chunk_id].get('metadata', {})
+                    # Note: Pinecone doesn't store the actual text in fetch, only metadata
+                    # We'll need to use the vectorstore to get the actual content
+                    result["current"] = chunk_id
+            except Exception as e:
+                print(f"❌ Error fetching current chunk {chunk_id}: {e}")
+            
+            # Get previous chunk
+            if prev_id:
+                try:
+                    prev_response = index.fetch(ids=[prev_id], namespace=namespace)
+                    if prev_id in prev_response.get('vectors', {}):
+                        result["previous"] = prev_id
+                except Exception as e:
+                    print(f"⚠️  Previous chunk {prev_id} not found: {e}")
+            
+            # Get next chunk
+            try:
+                next_response = index.fetch(ids=[next_id], namespace=namespace)
+                if next_id in next_response.get('vectors', {}):
+                    result["next"] = next_id
+            except Exception as e:
+                print(f"⚠️  Next chunk {next_id} not found: {e}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error in get_adjacent_chunks: {e}")
+            return {"current": None, "previous": None, "next": None}
+
+    def get_chunk_content_by_id(self, namespace: str, chunk_id: str) -> Optional[str]:
+        """
+        Get the actual text content of a chunk by its ID.
+        
+        Args:
+            namespace: Namespace to search in
+            chunk_id: ID of the chunk
+            
+        Returns:
+            Text content of the chunk or None if not found
+        """
+        try:
+            vectorstore = self.setup_vectorstore(namespace)
+            
+            # Use similarity search with the chunk ID as metadata filter
+            # This is a workaround since Pinecone doesn't store full text in fetch
+            docs = vectorstore.similarity_search(
+                query="",  # Empty query since we're filtering by ID
+                k=1,
+                filter={"chunk_id": chunk_id.split("_chunk_")[-1]} if "_chunk_" in chunk_id else {}
+            )
+            
+            if docs and len(docs) > 0:
+                return docs[0].page_content
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error getting chunk content for {chunk_id}: {e}")
+            return None
+
+    def _get_adjacent_chunks_content(self, namespace: str, doc_id: str, chunk_id: int) -> Dict[str, Optional[str]]:
+        """
+        Get the actual content of adjacent chunks for a given chunk.
+        
+        Args:
+            namespace: Namespace to search in
+            doc_id: Document ID
+            chunk_id: Chunk number (integer)
+            
+        Returns:
+            Dict containing previous, current, and next chunk content
+        """
+        try:
+            vectorstore = self.setup_vectorstore(namespace)
+            result = {"previous": None, "current": None, "next": None}
+            
+            # Get previous chunk (if chunk_id > 0)
+            if chunk_id > 0:
+                try:
+                    prev_docs = vectorstore.similarity_search(
+                        query="",
+                        k=50,  # Get more results to find the specific chunk
+                        filter={"document_id": doc_id, "chunk_id": chunk_id - 1}
+                    )
+                    if prev_docs and len(prev_docs) > 0:
+                        result["previous"] = prev_docs[0].page_content
+                        print(f"📄 Found previous chunk {doc_id}_chunk_{chunk_id - 1}")
+                except Exception as e:
+                    print(f"⚠️  Could not get previous chunk: {e}")
+            
+            # Get current chunk
+            try:
+                current_docs = vectorstore.similarity_search(
+                    query="",
+                    k=50,
+                    filter={"document_id": doc_id, "chunk_id": chunk_id}
+                )
+                if current_docs and len(current_docs) > 0:
+                    result["current"] = current_docs[0].page_content
+                    print(f"📄 Found current chunk {doc_id}_chunk_{chunk_id}")
+            except Exception as e:
+                print(f"⚠️  Could not get current chunk: {e}")
+            
+            # Get next chunk
+            try:
+                next_docs = vectorstore.similarity_search(
+                    query="",
+                    k=50,
+                    filter={"document_id": doc_id, "chunk_id": chunk_id + 1}
+                )
+                if next_docs and len(next_docs) > 0:
+                    result["next"] = next_docs[0].page_content
+                    print(f"📄 Found next chunk {doc_id}_chunk_{chunk_id + 1}")
+            except Exception as e:
+                print(f"⚠️  Could not get next chunk: {e}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error in _get_adjacent_chunks_content: {e}")
+            return {"previous": None, "current": None, "next": None}
 
     def _ensure_index_exists(self):
         """Ensure the Pinecone index exists, create if necessary."""
@@ -400,9 +562,11 @@ class AgentProcessor:
                     if not docs:
                         return f"KEINE DOKUMENTE IN GEFILTERTEN IDs: Keine relevanten Dokumente in {target_doc_ids} gefunden."
                 
-                # Extract content with comprehensive error handling
+                # Extract content with comprehensive error handling and adjacent chunks
                 results = []
                 found_doc_ids = set()
+                chunk_counter = 1
+                
                 for i, doc in enumerate(docs):
                     try:
                         # Validate document structure
@@ -414,8 +578,10 @@ class AgentProcessor:
                         if not isinstance(doc.metadata, dict):
                             print(f"⚠️  Dokument {i} hat ungültige Metadata: {doc.metadata}")
                             doc_id = f"unknown_{i}"
+                            chunk_id = None
                         else:
                             doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', f'unknown_{i}'))
+                            chunk_id = doc.metadata.get('chunk_id')
                         
                         # Safe content extraction
                         content = getattr(doc, 'page_content', '')
@@ -428,7 +594,51 @@ class AgentProcessor:
                             continue
                         
                         found_doc_ids.add(doc_id)
-                        results.append(f"[DOC_ID: {doc_id}] {content}")
+                        
+                        # Try to get adjacent chunks if we have chunk metadata
+                        if chunk_id is not None and isinstance(chunk_id, int):
+                            try:
+                                # Construct the full chunk ID
+                                full_chunk_id = f"{doc_id}_chunk_{chunk_id}"
+                                print(f"🔗 Suche Adjacent Chunks für: {full_chunk_id}")
+                                
+                                # Get adjacent chunks using vectorstore similarity search
+                                adjacent_chunks = self._get_adjacent_chunks_content(namespace, doc_id, chunk_id)
+                                
+                                # Build the enhanced result with adjacent chunks
+                                chunk_set = []
+                                
+                                # Previous chunk
+                                if adjacent_chunks.get("previous"):
+                                    chunk_set.append(f"--- CHUNK {chunk_counter}a (VORHERIGER) START ---")
+                                    chunk_set.append(adjacent_chunks["previous"])
+                                    chunk_set.append(f"--- CHUNK {chunk_counter}a (VORHERIGER) END ---")
+                                
+                                # Current chunk (main hit)
+                                chunk_set.append(f"--- CHUNK {chunk_counter}b (HAUPTTREFFER) START ---")
+                                chunk_set.append(content)
+                                chunk_set.append(f"--- CHUNK {chunk_counter}b (HAUPTTREFFER) END ---")
+                                
+                                # Next chunk
+                                if adjacent_chunks.get("next"):
+                                    chunk_set.append(f"--- CHUNK {chunk_counter}c (NÄCHSTER) START ---")
+                                    chunk_set.append(adjacent_chunks["next"])
+                                    chunk_set.append(f"--- CHUNK {chunk_counter}c (NÄCHSTER) END ---")
+                                
+                                enhanced_content = "\n".join(chunk_set)
+                                results.append(f"[DOC_ID: {doc_id}] {enhanced_content}")
+                                
+                                print(f"✅ Enhanced chunk {chunk_counter} mit Adjacent Chunks")
+                                
+                            except Exception as adjacent_error:
+                                print(f"⚠️  Fehler bei Adjacent Chunks für {doc_id}_chunk_{chunk_id}: {adjacent_error}")
+                                # Fallback to normal content
+                                results.append(f"[DOC_ID: {doc_id}] {content}")
+                        else:
+                            # No chunk metadata, use normal content
+                            results.append(f"[DOC_ID: {doc_id}] {content}")
+                        
+                        chunk_counter += 1
                         
                     except Exception as extract_error:
                         print(f"❌ Fehler beim Extrahieren von Dokument {i}: {str(extract_error)}")
