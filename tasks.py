@@ -16,7 +16,7 @@ agent_processor = AgentProcessor(
 
 
 @celery.task(bind=True, name="tasks.process_document")
-def process_document(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false"):
+def process_document(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false", special_pages: list = None):
     """
     Process a document asynchronously using Celery with AgentProcessor.
     
@@ -31,6 +31,7 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
         fileID: Unique document identifier
         filename: Original filename
         hasTablesOrGraphics: Whether to use page-based chunking ("true") or sentence-based chunking ("false")
+        special_pages: List of page numbers (1-indexed) for special processing as images
         
     Returns:
         Dict containing processing results and status
@@ -92,7 +93,7 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
         )
         
         # Process the document using the new AgentProcessor
-        result = agent_processor.process_document_full(file_content, namespace, fileID, filename, hasTablesOrGraphics)
+        result = agent_processor.process_document_full(file_content, namespace, fileID, filename, hasTablesOrGraphics, special_pages)
         
         # Update status: Finalizing processing
         if agent_processor._firebase_available:

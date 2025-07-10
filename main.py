@@ -18,6 +18,7 @@ import json
 import asyncio
 from celery.exceptions import Ignore
 from starlette.responses import JSONResponse
+from typing import List, Optional
 
 # Load environment variables
 load_dotenv()
@@ -94,7 +95,7 @@ async def root():
     }
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...), hasTablesOrGraphics: str = Form(...)):
+async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...), hasTablesOrGraphics: str = Form(...), numberPages: Optional[str] = Form(None)):
     """
     Upload and process a PDF document asynchronously using AgentProcessor.
     
@@ -103,12 +104,14 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         namespace: Namespace for organizing documents  
         fileID: Unique identifier for the document
         additionalInfo: Additional information (currently unused)
+        hasTablesOrGraphics: Whether to use page-based chunking
+        numberPages: Comma-separated list of page numbers for special processing (1-indexed)
         
     Returns:
         Dict containing upload status and task information
     """
     try:
-        print(f"Upload request received: filename={file.filename}, namespace={namespace}, fileID={fileID}")
+        print(f"Upload request received: filename={file.filename}, namespace={namespace}, fileID={fileID}, numberPages={numberPages}, {type(numberPages)}")
         
         if not file.filename.lower().endswith('.pdf'):
             return {
@@ -120,13 +123,27 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         content = await file.read()
         print(f"File content read: {len(content)} bytes")
         
-        task = process_document.delay(content, namespace, fileID, file.filename, hasTablesOrGraphics)
+        # Parse numberPages from string to list of integers if provided
+        special_pages = []
+        if numberPages:
+            try:
+                special_pages = [int(page.strip()) for page in numberPages.split(',') if page.strip()]
+                print(f"Special pages to process: {special_pages}")
+            except ValueError:
+                return {
+                    "status": "error",
+                    "message": "numberPages must be a comma-separated list of integers",
+                    "filename": file.filename
+                }
+        
+        task = process_document.delay(content, namespace, fileID, file.filename, hasTablesOrGraphics, special_pages)
         
         return {
             "status": "success",
             "message": "File upload started - will be processed with CrewAI agents",
             "task_id": task.id,
-            "filename": file.filename
+            "filename": file.filename,
+            "special_pages": special_pages
         }
     except Exception as e:
         print(f"Upload error: {str(e)}")

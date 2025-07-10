@@ -132,28 +132,79 @@ class VectorManager:
                     "pdf_id": fileID, 
                     "document_id": fileID, 
                     "type": "chunk", 
-                    "chunk_id": i
+                    "chunk_id": i,
+                    "is_special_vector": False
                 }
                 
-                # Page information no longer tracked
+                # Add page information if available from chunks_with_pages
+                if chunks_with_pages and i < len(chunks_with_pages):
+                    chunk_data = chunks_with_pages[i]
+                    if "pages" in chunk_data:
+                        metadata["pages"] = chunk_data["pages"]
+                        metadata["page_range"] = chunk_data["page_range"]
+                        metadata["first_page"] = min(chunk_data["pages"])
+                        metadata["last_page"] = max(chunk_data["pages"])
+                        print(f"📄 Chunk {i}: pages {chunk_data['page_range']}")
                 
                 metadatas.append(metadata)
             
             # Add summary metadata
-            metadatas.append({"pdf_id": fileID, "document_id": fileID, "type": "summary"})
+            metadatas.append({
+                "pdf_id": fileID, 
+                "document_id": fileID, 
+                "type": "summary",
+                "is_special_vector": False
+            })
             
-            # Add texts to vectorstore with retry mechanism
-            ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"]
+            # Prepare special pages data if available
+            special_pages_texts = []
+            special_pages_metadatas = []
+            special_pages_ids = []
             
-            print(f"📤 Indexing {len(texts)} texts for document {fileID}")
-            print(f"📊 Text lengths: {[len(text) for text in texts[:5]]}...")  # Show first 5 lengths
+            if processed_pdf.get("special_pages_data"):
+                special_pages_data = processed_pdf["special_pages_data"]
+                print(f"📸 Creating {len(special_pages_data)} ADDITIONAL vectors for special pages (these are extra, not replacements)")
+                
+                for i, page_data in enumerate(special_pages_data):
+                    # Create text content combining image info and text
+                    special_text = f"ENHANCED PAGE {page_data['page_number']} (OPENAI VISION):\n"
+                    special_text += f"Base64 Image Data: {page_data['image_base64'][:100]}...\n"
+                    special_text += f"OpenAI Vision Extracted Text:\n{page_data['text']}"
+                    
+                    special_pages_texts.append(special_text)
+                    special_pages_metadatas.append({
+                        "pdf_id": fileID,
+                        "document_id": fileID,
+                        "type": "special_page",
+                        "page_number": page_data["page_number"],
+                        "image_format": page_data["image_format"],
+                        "image_size": page_data["image_size"],
+                        "text_length": page_data["text_length"],
+                        "has_image": True,
+                        "is_special_vector": True,
+                        "extracted_with_openai": page_data.get("extracted_with_openai", False)
+                    })
+                    special_pages_ids.append(f"{fileID}_special_page_{page_data['page_number']}")
+            
+            # Combine regular and special page content
+            all_texts = texts + special_pages_texts
+            all_metadatas = metadatas + special_pages_metadatas
+            all_ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"] + special_pages_ids
+            
+            print(f"📤 Indexing {len(all_texts)} texts for document {fileID} (including {len(special_pages_texts)} additional enhanced pages)")
+            print(f"📊 Text lengths: {[len(text) for text in all_texts[:5]]}...")  # Show first 5 lengths
+            if chunks_with_pages:
+                print(f"📄 Normal chunks with page tracking: {len([c for c in chunks_with_pages if 'pages' in c])}")
+            print(f"📸 Additional enhanced page vectors: {len(special_pages_texts)}")
             
             # Retry mechanism for Pinecone upload
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+                    vectorstore.add_texts(texts=all_texts, metadatas=all_metadatas, ids=all_ids)
                     print(f"✅ Successfully indexed document {fileID} on attempt {attempt + 1}")
+                    if special_pages_texts:
+                        print(f"📸 Successfully indexed {len(special_pages_texts)} ADDITIONAL special page vectors (pages exist twice now: normal + enhanced)")
                     break
                 except Exception as upload_error:
                     print(f"❌ Attempt {attempt + 1} failed: {str(upload_error)}")
@@ -170,7 +221,8 @@ class VectorManager:
                 "status": "success",
                 "message": f"Document {fileID} indexed successfully",
                 "chunks": len(processed_pdf["chunks"]),
-                "vector_ids": ids
+                "special_pages": len(special_pages_texts),
+                "vector_ids": all_ids
             }
             
         except Exception as e:

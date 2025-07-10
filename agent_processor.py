@@ -712,7 +712,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 "additional_info": f"Fehler aufgetreten: {type(e).__name__}"
             }
 
-    def process_document_full(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false") -> Dict[str, Any]:
+    def process_document_full(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false", special_pages: list = None) -> Dict[str, Any]:
         """
         Complete document processing pipeline from PDF to indexed content.
         
@@ -722,13 +722,14 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             fileID: Unique document identifier
             filename: Original filename
             hasTablesOrGraphics: Whether PDF has tables/graphics requiring page-based chunking
+            special_pages: List of page numbers (1-indexed) for special processing as images
             
         Returns:
             Dict containing processing results and status
         """
         try:
             # Step 1: Extract PDF content using DocProcessor
-            pdf_data = self._doc_processor.extract_pdf(file_content, hasTablesOrGraphics)
+            pdf_data = self._doc_processor.extract_pdf(file_content, hasTablesOrGraphics, special_pages)
             if not pdf_data:
                 return {
                     "status": "error",
@@ -736,7 +737,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 }
             
             # Step 2: Process content (chunk and summarize) using DocProcessor
-            processed_pdf = self._doc_processor.process_pdf_content(pdf_data, filename, hasTablesOrGraphics)
+            processed_pdf = self._doc_processor.process_pdf_content(pdf_data, filename, hasTablesOrGraphics, special_pages)
             if not processed_pdf:
                 return {
                     "status": "error",
