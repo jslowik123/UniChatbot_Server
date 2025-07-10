@@ -451,3 +451,5 @@ class FirebaseConnection:
         except Exception as e:
             return {'status': 'error', 'message': f'Fehler beim Abrufen: {str(e)}'}
 
+
+

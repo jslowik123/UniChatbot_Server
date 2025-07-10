@@ -16,7 +16,7 @@ agent_processor = AgentProcessor(
 
 
 @celery.task(bind=True, name="tasks.process_document")
-def process_document(self, file_content: bytes, namespace: str, fileID: str, filename: str):
+def process_document(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false"):
     """
     Process a document asynchronously using Celery with AgentProcessor.
     
@@ -30,6 +30,7 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
         namespace: Pinecone namespace for organization
         fileID: Unique document identifier
         filename: Original filename
+        hasTablesOrGraphics: Whether to use page-based chunking ("true") or sentence-based chunking ("false")
         
     Returns:
         Dict containing processing results and status
@@ -60,13 +61,13 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
         if agent_processor._firebase_available:
             agent_processor._firebase.update_document_status(namespace, fileID, {
                 'progress': 25,
-                'status': 'Reading document with pdfplumber'
+                'status': 'Reading document with pdfminer'
             })
         
         self.update_state(
             state='PROCESSING',
             meta={
-                'status': 'Reading document with pdfplumber',
+                'status': 'Reading document with pdfminer',
                 'current': 25,
                 'total': 100,
                 'file': filename
@@ -91,7 +92,7 @@ def process_document(self, file_content: bytes, namespace: str, fileID: str, fil
         )
         
         # Process the document using the new AgentProcessor
-        result = agent_processor.process_document_full(file_content, namespace, fileID, filename)
+        result = agent_processor.process_document_full(file_content, namespace, fileID, filename, hasTablesOrGraphics)
         
         # Update status: Finalizing processing
         if agent_processor._firebase_available:
@@ -195,7 +196,7 @@ def generate_namespace_summary(namespace: str):
 
 
 @celery.task(name="tasks.generate_assessment")
-def generate_assessment(namespace: str):
+def generate_assessment(namespace: str, additional_info: str = None):
     """
     Generate assessment data for a namespace after document processing is complete.
     
@@ -204,23 +205,25 @@ def generate_assessment(namespace: str):
     
     Args:
         namespace: The namespace to generate assessment for
+        additional_info: Optional additional information about chatbot goals
         
     Returns:
         Dict containing assessment generation status and results
     """
     try:
-        # Import the assessment function from main
-        from main import get_assessment_data
-        
-        # Get the additional_info (project info) from Firebase
-        if agent_processor._firebase_available:
-            project_info_result = agent_processor._firebase.get_project_info(namespace)
-            if project_info_result.get("status") == "success":
-                additional_info = project_info_result.get("info", "")
+        # Get the additional_info (project info) from Firebase if not provided
+        if not additional_info:
+            if agent_processor._firebase_available:
+                project_info_result = agent_processor._firebase.get_project_info(namespace)
+                if project_info_result.get("status") == "success":
+                    additional_info = project_info_result.get("info", "")
+                else:
+                    additional_info = "Keine spezifischen Ziele definiert."
             else:
-                additional_info = "Keine spezifischen Ziele definiert."
-        else:
-            additional_info = "Firebase nicht verfügbar - keine Projektinfo verfügbar."
+                additional_info = "Firebase nicht verfügbar - keine Projektinfo verfügbar."
+        
+        # Import the assessment function from main to maintain API compatibility
+        from main import get_assessment_data
         
         # Generate the assessment
         assessment_result = get_assessment_data(namespace, additional_info)

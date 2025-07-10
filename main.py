@@ -1,6 +1,5 @@
 import logging
 logging.basicConfig(level=logging.INFO)
-
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,12 +12,12 @@ from agent_chatbot import get_bot, message_bot_agent
 from firebase_connection import FirebaseConnection
 from celery_app import test_task, celery
 from tasks import process_document, generate_assessment
+from assessment_service import AssessmentService
 from redis import Redis
 import json
 import asyncio
 from celery.exceptions import Ignore
 from starlette.responses import JSONResponse
-from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -57,6 +56,9 @@ app.add_middleware(
 pc = Pinecone(api_key=pinecone_api_key)
 agent_processor = AgentProcessor(pinecone_api_key, openai_api_key)
 
+# Initialize services
+assessment_service = AssessmentService(agent_processor)
+
 class ChatState:
     """
     Manages the state of the chatbot conversation using AgentChatbot.
@@ -88,11 +90,11 @@ async def root():
         "message": "Welcome to the Uni Chatbot API - Agent Edition", 
         "status": "online", 
         "version": API_VERSION,
-        "features": ["CrewAI Agents", "Agentic RAG", "PDFPlumber", "Streaming Responses", "Structured Outputs"]
+        "features": ["CrewAI Agents", "Agentic RAG", "PDFMiner", "Streaming Responses", "Structured Outputs"]
     }
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...)):
+async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), fileID: str = Form(...), additionalInfo: str = Form(...), hasTablesOrGraphics: str = Form(...)):
     """
     Upload and process a PDF document asynchronously using AgentProcessor.
     
@@ -118,7 +120,7 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         content = await file.read()
         print(f"File content read: {len(content)} bytes")
         
-        task = process_document.delay(content, namespace, fileID, file.filename)
+        task = process_document.delay(content, namespace, fileID, file.filename, hasTablesOrGraphics)
         
         return {
             "status": "success",
@@ -483,44 +485,24 @@ def _handle_task_state(task) -> dict:
 @app.get("/task_status/{task_id}")
 async def get_task_status(task_id: str):
     """
-    Get the status of an asynchronous task.
+    Get status of a specific task by its ID.
     
     Args:
-        task_id: Unique identifier of the task to check
+        task_id: Celery task identifier
         
     Returns:
-        Dict containing task status, progress, and results
+        Dict containing current task status and progress information
         
     Raises:
-        HTTPException: If task failed or status check encountered an error
+        HTTPException: If task fails or encounters errors
     """
     try:
         task = celery.AsyncResult(task_id)
-        print(f"Task state: {task.state}")
-        print(f"Task info: {task.info}")
-        print(f"Task result: {task.result}")
-        
-        response = _handle_task_state(task)
-        print(f"Sending response: {response}")
-        return response
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
+        return _handle_task_state(task)
     except Exception as e:
-        print(f"Error in task status: {str(e)}")
-        error_detail = {
-            'state': 'ERROR',
-            'status': 'ERROR',
-            'message': 'Error checking task status',
-            'error': {
-                'type': type(e).__name__,
-                'message': str(e),
-                'details': 'Error occurred while checking task status'
-            },
-            'progress': 0
-        }
-        raise HTTPException(status_code=500, detail=error_detail)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 async def _stream_error_response(message: str):
     """
@@ -534,86 +516,6 @@ async def _stream_error_response(message: str):
     """
     yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
 
-@app.post("/send_message_stream")
-async def send_message_stream(user_input: str = Form(...), namespace: str = Form(...)):
-    """
-    Streaming version of send_message with real-time AI response chunks using CrewAI agents.
-    
-    Sends Server-Sent Events with incremental response chunks as the AI agent
-    generates the response, providing real-time feedback to the user.
-    
-    Args:
-        user_input: User's question or message  
-        namespace: Namespace to search for relevant documents
-        
-    Returns:
-        StreamingResponse with Server-Sent Events
-    """
-    if not chat_state.agent_chatbot:
-        return StreamingResponse(
-            _stream_error_response("Agent bot not started. Please call /start_bot first"),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-            }
-        )
-    
-    async def generate_response():
-        try:
-            # Get or initialize chat history for this namespace
-            if namespace not in chat_state.chat_history:
-                chat_state.chat_history[namespace] = []
-            
-            history = chat_state.chat_history[namespace]
-            
-            # Use the chatbot's stream_message method
-            chatbot = get_bot()
-            accumulated_response = ""
-            
-            # Send initial processing event
-            yield f"data: {json.dumps({'type': 'start'})}\n\n"
-            
-            async for chunk in chatbot.stream_message(user_input, namespace, history):
-                accumulated_response += chunk
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-            
-            # Update chat history
-            chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
-            chat_state.chat_history[namespace].append({"role": "assistant", "content": accumulated_response})
-            
-            # Keep only last 20 messages
-            if len(chat_state.chat_history[namespace]) > 20:
-                chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
-            
-            # Send completion event with structured data
-            final_response = {
-                "type": "complete",
-                "fullResponse": accumulated_response,
-                "structured_response": {
-                    "answer": accumulated_response,
-                    "document_ids": [],  # Placeholder
-                    "sources": [],  # Placeholder
-                    "confidence_score": 0.95,  # Placeholder
-                    "context_used": True,  # Placeholder
-                }
-            }
-            yield f"data: {json.dumps(final_response)}\n\n"
-            
-        except Exception as e:
-            print(f"Error in send_message_stream: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-    
-    return StreamingResponse(
-        generate_response(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        }
-    )
 
 @app.get("/namespace_info/{namespace}")
 async def get_namespace_info(namespace: str):
@@ -662,82 +564,13 @@ async def get_project_info(project_name: str):
 
 
 def get_assessment_data(namespace: str, additional_info: str):
-    dokumente = agent_processor.get_documents(namespace)
-    chatbot_ziel = additional_info
-    print(chatbot_ziel)
-    client = OpenAI()
     """
-    Get assessment data for a namespace.
-    """
-    print(dokumente)
-    system_prompt = """
-    Du bist ein Experte für Bildungstechnologie und Wissensanalyse. Ein Benutzer möchte einen Chatbot für Studierende erstellen. Dazu hat er Dokumente hochgeladen, die das Fachwissen des Chatbots bilden sollen. Außerdem hat er eine Zielbeschreibung beigefügt, was der Chatbot ungefähr können oder leisten soll.
-
-    Deine Aufgabe ist eine strukturierte Analyse mit KURZEN STICHWORTEN zu erstellen:
-
-    WICHTIG: Antworte im JSON-Format mit exakt diesen Feldern:
-    {
-        "vorhandene_dokumente": ["Stichwort 1", "Stichwort 2", "Stichwort 3"],
-        "fehlende_dokumente": ["Fehlendes Dokument 1", "Fehlendes Dokument 2"],
-        "tipps": ["Kurzer Tipp 1", "Kurzer Tipp 2"],
-        "wissensstand": "Kurze Beschreibung des Wissensstands des Chatbots, also was alles beantwortet werden kann (5-10 Sätze)",
-        
-        "confidence": 85
-    }
-
-    Regeln für die Stichworte:
-    - "vorhanden": Kurze Namen der vorhandenen Dokumenttypen (z.B. "Modulhandbuch Bachelor", "Studienordnung")
-    - "fehlt": Konkrete fehlende Dokumenttypen (z.B. "Prüfungsordnung", "Stundenplan", "Praktikumsordnung")
-    - "tipps": Maximal 3-4 Wörter pro Tipp (z.B. "Aktuelle Prüfungstermine hinzufügen", "FAQ für Erstsemester")
-    - "confidence": Zahl zwischen 0-100 für wie vollständing deiner meinung nach der Chatbot ist, im Hinblick auf das Ziel.
-
-    WICHTIGE REGEL FÜR "FEHLT":
-    Analysiere die Zielbeschreibung des Chatbots genau. Wenn bestimmte Dokumenttypen für das spezifische Ziel NICHT RELEVANT sind, dann markiere sie NICHT als fehlend.
+    Get assessment data for a namespace using AssessmentService.
     
-    Beispiele:
-    - Wenn der Chatbot nur für "allgemeine Studienberatung" gedacht ist → keine spezifischen Fachmodule als fehlend markieren
-    - Wenn der Chatbot nur für "Erstsemester-Info" gedacht ist → keine Master-spezifischen Dokumente als fehlend markieren
-    - Wenn der Chatbot nur für "einen spezifischen Studiengang" gedacht ist → keine anderen Studiengänge als fehlend markieren
-    - Wenn der Chatbot für "organisatorische Fragen" gedacht ist → keine fachlichen Inhalte als fehlend markieren
-
-    Fokussiere dich nur auf Dokumente, die für das SPEZIFISCHE ZIEL des Chatbots wirklich notwendig sind.
-
-    Denke an typische Universitätsdokumente:
-    - Modulhandbücher, Prüfungsordnungen, Studienordnungen
-    - Stundenpläne, Vorlesungsverzeichnis
-
-    Antworte NUR mit dem JSON-Objekt, keine weiteren Erklärungen.
+    This function is called by the Celery task and maintains compatibility
+    with the existing trigger_assessment endpoint.
     """
-
-    user_prompt = f"""
-    Ziel des Chatbots:
-    {chatbot_ziel}
-
-    Vorliegende Dokumente:
-    {dokumente}
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",  # oder dein gewünschtes Modell
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_prompt.strip()},
-        ],
-        temperature=0.3,
-        stream=False,
-    )
-
-    assessment_content = response.choices[0].message.content
-
-    # Speichere das Assessment in Firebase unter files/{namespace}/assessment
-    try:
-        agent_processor._firebase._db.reference(f'files/{namespace}/assessment').set(assessment_content)
-        firebase_status = "success"
-    except Exception as e:
-        firebase_status = f"error: {str(e)}"
-
-    return {"status": "success", "assessment": assessment_content, "firebase_status": firebase_status}
+    return assessment_service.generate_assessment(namespace, additional_info)
       
 @app.post("/trigger_assessment")
 async def trigger_assessment(namespace: str = Form(...)):

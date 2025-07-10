@@ -1,12 +1,12 @@
 from openai import OpenAI
-import PyPDF2
+import pymupdf  # PyMuPDF
 from typing import Dict, Any, List, Tuple, Optional
 from pinecone import Pinecone
 import json
 import os
 import unicodedata
 import re
-from pinecone_connection import PineconeCon
+import io
 from firebase_connection import FirebaseConnection
 
 # Constants
@@ -44,7 +44,6 @@ class DocProcessor:
             
         self._openai = OpenAI(api_key=openai_api_key)
         self._pinecone = Pinecone(api_key=pinecone_api_key)
-        self._con = PineconeCon("userfiles")
         
         try:
             self._firebase = FirebaseConnection()
@@ -52,6 +51,172 @@ class DocProcessor:
         except ValueError as e:
             print(f"Firebase nicht verfügbar: {e}")
             self._firebase_available = False
+
+    def _extract_page_text(self, page, page_num: int) -> Dict[str, Any]:
+        """
+        Extract text from a single PDF page.
+        
+        Args:
+            page: PyMuPDF page object
+            page_num: Page number (0-indexed)
+            
+        Returns:
+            Dict containing page number and text
+        """
+        page_text = page.get_text()
+        
+        page_data = {
+            "page_number": page_num + 1,  # 1-indexed for user-friendly display
+            "text": page_text
+        }
+        
+        return page_data
+
+    def _split_text_by_pages(self, pages_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Split text into page-based chunks (one chunk per page) for documents with tables/graphics.
+        
+        Each page becomes a separate chunk.
+        
+        Args:
+            pages_data: List of dictionaries containing page_number and text
+            
+        Returns:
+            List of dictionaries containing text chunks
+        """
+        if not pages_data:
+            return []
+            
+        chunks = []
+        
+        for page_data in pages_data:
+            page_num = page_data["page_number"]
+            page_text = page_data["text"]
+            
+            if not page_text or not page_text.strip():
+                continue
+                
+            # Clean the page text
+            cleaned_text = self._clean_extracted_text(page_text)
+            
+            if not cleaned_text.strip():
+                continue
+            
+            chunk_data = {
+                "text": cleaned_text.strip()
+            }
+            
+            chunks.append(chunk_data)
+            
+        return chunks
+
+    def extract_pdf(self, file_content: bytes, hasTablesOrGraphics: str = "false") -> Optional[Dict[str, Any]]:
+        """
+        Extract text and metadata from PDF content using PyMuPDF.
+        
+        Args:
+            file_content: Raw PDF file content as bytes
+            hasTablesOrGraphics: Parameter for page-based chunking (for future use)
+            
+        Returns:
+            Dict containing extracted text with page information and metadata, or None if extraction fails
+        """
+        try:
+            # Create a BytesIO object from the file content
+            pdf_file = io.BytesIO(file_content)
+            
+            # Open PDF with PyMuPDF
+            doc = pymupdf.open(stream=pdf_file, filetype="pdf")
+            
+            # Extract text from all pages with page information
+            pages_data = []
+            full_text = ""
+            metadata = {
+                "page_count": len(doc),
+                "title": doc.metadata.get("title", ""),
+                "author": doc.metadata.get("author", ""),
+                "subject": doc.metadata.get("subject", ""),
+                "creator": doc.metadata.get("creator", "")
+            }
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                
+                # Extract page data (text only)
+                page_data = self._extract_page_text(page, page_num)
+                pages_data.append(page_data)
+                
+                full_text += page_data["text"] + "\n"
+            
+            doc.close()
+            
+            # Clean up the extracted text
+            full_text = self._clean_extracted_text(full_text)
+            
+            print(f"📄 PyMuPDF extracted {len(full_text)} characters from {metadata['page_count']} pages")
+            return {
+                "text": full_text or "", 
+                "pages_data": pages_data,
+                "metadata": metadata
+            }
+        except Exception as e:
+            print(f"Fehler beim PDF-Verarbeiten mit PyMuPDF: {e}")
+            return None
+
+    def process_pdf_content(self, pdf_data: Dict[str, Any], filename: str, hasTablesOrGraphics: str = "false") -> Optional[Dict[str, Any]]:
+        """
+        Process extracted PDF content by chunking and summarizing.
+        
+        Args:
+            pdf_data: Dictionary containing text, pages_data and metadata from PDF
+            filename: Original filename for identification
+            hasTablesOrGraphics: Whether to use page-based chunking ("true") or sentence-based chunking ("false")
+            
+        Returns:
+            Dict containing processed chunks with page info and summary, or None if processing fails
+        """
+        if not pdf_data or not pdf_data.get("text"):
+            return None
+        
+        try:
+            # Use page-based chunking when hasTablesOrGraphics is "true"
+            if hasTablesOrGraphics.lower() == "true" and pdf_data.get("pages_data"):
+                # Create one chunk per page when handling tables/graphics
+                chunks_with_pages = self._split_text_by_pages(pdf_data["pages_data"])
+                chunks = [chunk["text"] for chunk in chunks_with_pages]
+            elif pdf_data.get("pages_data"):
+                # Use normal sentence-based chunking with page tracking
+                chunks_with_pages = self._split_text_with_page_tracking(pdf_data["pages_data"])
+                chunks = [chunk["text"] for chunk in chunks_with_pages]
+            else:
+                # Fallback to regular chunking
+                chunks = self._split_text(pdf_data["text"])
+                chunks_with_pages = None
+            
+            # Generate summary
+            summary_prompt = f"Fasse diesen Text zusammen (max. 1000 Zeichen): {pdf_data['text'][:10000]}"
+            summary_response = self._openai.chat.completions.create(
+                model=DEFAULT_MODEL,
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=DEFAULT_TEMPERATURE
+            )
+            summary = summary_response.choices[0].message.content
+            
+            result = {
+                "pdf_id": filename,
+                "chunks": chunks,
+                "summary": summary,
+                "metadata": pdf_data["metadata"]
+            }
+            
+            # Add page information if available
+            if chunks_with_pages:
+                result["chunks_with_pages"] = chunks_with_pages
+            
+            return result
+        except Exception as e:
+            print(f"Fehler beim Verarbeiten der PDF-Inhalte: {e}")
+            return None
 
     def process_pdf(self, file_path: str, namespace: str, fileID: str) -> Dict[str, Any]:
         """
@@ -73,12 +238,32 @@ class DocProcessor:
             raise FileNotFoundError(f"PDF file not found: {file_path}")
             
         try:
-            with open(file_path, "rb") as f:
-                pdf_reader = PyPDF2.PdfReader(f)
-                text = self._extract_text_from_pdf_reader(pdf_reader)
+            # Use PyMuPDF to extract text directly from file path
+            doc = pymupdf.open(file_path)
+            
+            # Extract text from all pages with page information
+            pages_data = []
+            full_text = ""
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                page_text = page.get_text()
+                
+                # Store page data for later processing
+                pages_data.append({
+                    "page_number": page_num + 1,  # 1-indexed for user-friendly display
+                    "text": page_text
+                })
+                
+                full_text += page_text + "\n"
+            
+            doc.close()
+            
+            # Clean up the text
+            full_text = self._clean_extracted_text(full_text)
 
             file_name = os.path.basename(file_path)
-            return self._process_extracted_text(text, namespace, fileID, file_name)
+            return self._process_extracted_text_with_pages(full_text, pages_data, namespace, fileID, file_name)
             
         except Exception as e:
             return {
@@ -100,10 +285,35 @@ class DocProcessor:
             Dict containing processing results with status, message, and metadata
         """
         try:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = self._extract_text_from_pdf_reader(pdf_reader)
+            # Convert to BytesIO if it's raw bytes
+            if isinstance(pdf_file, bytes):
+                pdf_file = io.BytesIO(pdf_file)
             
-            return self._process_extracted_text(text, namespace, fileID, file_name)
+            # Use PyMuPDF to extract text from file-like object
+            doc = pymupdf.open(stream=pdf_file, filetype="pdf")
+            
+            # Extract text from all pages with page information
+            pages_data = []
+            full_text = ""
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                page_text = page.get_text()
+                
+                # Store page data for later processing
+                pages_data.append({
+                    "page_number": page_num + 1,  # 1-indexed for user-friendly display
+                    "text": page_text
+                })
+                
+                full_text += page_text + "\n"
+            
+            doc.close()
+            
+            # Clean up the text
+            full_text = self._clean_extracted_text(full_text)
+            
+            return self._process_extracted_text_with_pages(full_text, pages_data, namespace, fileID, file_name)
             
         except Exception as e:
             return {
@@ -111,32 +321,41 @@ class DocProcessor:
                 "message": f"Error processing PDF bytes: {str(e)}"
             }
     
-    def _extract_text_from_pdf_reader(self, pdf_reader: PyPDF2.PdfReader) -> str:
+    def _clean_extracted_text(self, text: str) -> str:
         """
-        Extract text from a PDF reader object.
+        Clean and normalize extracted text from PDF.
         
         Args:
-            pdf_reader: PyPDF2 PdfReader instance
+            text: Raw extracted text
             
         Returns:
-            str: Extracted text from all pages
+            str: Cleaned text
         """
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+        if not text:
+            return ""
+        
+        # Replace multiple whitespaces with single space but preserve paragraphs
+        text = re.sub(r'[ \t]+', ' ', text)  # Multiple spaces/tabs -> single space
+        text = re.sub(r'\n[ \t]*\n', '\n\n', text)  # Preserve paragraph breaks
+        text = re.sub(r'\n+', '\n', text)  # Multiple newlines -> single newline
+        text = text.strip()
+        
+        # Remove common PDF artifacts
+        text = re.sub(r'[^\w\s\n.,!?;:()\-\[\]{}"\'/]', '', text, flags=re.UNICODE)
+        
+        # Additional cleanup for common HTML-like artifacts
         replacements = {
-            "<br>":"",
-            "<p>":"",
-            "</p>":"",
-            "|":"",
-            "•":"",
-            "_":"",
-            "..":"",
-            ". .":"",
-            "...":"",
-            "\n":"",
-            "\r\n":"",
-            "*":"",
+            "<br>": "",
+            "<p>": "",
+            "</p>": "",
+            "|": "",
+            "•": "",
+            "_": "",
+            "..": "",
+            ". .": "",
+            "...": "",
+            "\r\n": "",
+            "*": "",
         }
 
         for old, new in replacements.items():
@@ -146,7 +365,10 @@ class DocProcessor:
     
     def _process_extracted_text(self, text: str, namespace: str, fileID: str, file_name: str) -> Dict[str, Any]:
         """
-        Process extracted text by cleaning, chunking, and storing in databases.
+        Process extracted text by cleaning, chunking, and extracting metadata.
+        
+        Note: This method only processes the text and extracts metadata.
+        Vector storage is handled by AgentProcessor.
         
         Args:
             text: Raw extracted text
@@ -155,23 +377,72 @@ class DocProcessor:
             file_name: Original filename
             
         Returns:
-            Dict containing processing results
+            Dict containing processing results including chunks and metadata
         """
         try:
             keywords, summary = self._extract_keywords_and_summary(text)
             chunks = self._split_text(text)
             
-            pinecone_result = self._con.upload(chunks, namespace, file_name, fileID=fileID)
-
+            # Store metadata in Firebase if available
             firebase_result = self._store_metadata(namespace, fileID, len(chunks), keywords, summary)
             
             return {
                 "status": "success",
                 "message": f"File {file_name} processed successfully",
                 "chunks": len(chunks),
-                "pinecone_result": pinecone_result,
+                "text_chunks": chunks,
+                "summary": summary,
+                "keywords": keywords,
                 "firebase_result": firebase_result,
                 "original_file": file_name
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Error in text processing pipeline: {str(e)}"
+            }
+    
+    def _process_extracted_text_with_pages(self, text: str, pages_data: List[Dict[str, Any]], namespace: str, fileID: str, file_name: str) -> Dict[str, Any]:
+        """
+        Process extracted text by cleaning, chunking, and extracting metadata.
+        
+        Note: This method only processes the text and extracts metadata.
+        Vector storage is handled by AgentProcessor.
+        
+        Args:
+            text: Raw extracted text
+            pages_data: List of dictionaries containing page number and text
+            namespace: Pinecone namespace
+            fileID: Document identifier
+            file_name: Original filename
+            
+        Returns:
+            Dict containing processing results including chunks and metadata
+        """
+        try:
+            keywords, summary = self._extract_keywords_and_summary(text)
+            
+            # Use page-aware chunking for better text processing
+            chunks_with_pages = self._split_text_with_page_tracking(pages_data)
+            
+            # Extract just the text for backward compatibility
+            text_chunks = [chunk["text"] for chunk in chunks_with_pages]
+            
+            # Store metadata in Firebase if available
+            firebase_result = self._store_metadata(namespace, fileID, len(text_chunks), keywords, summary)
+            
+            return {
+                "status": "success",
+                "message": f"File {file_name} processed successfully",
+                "chunks": len(text_chunks),
+                "text_chunks": text_chunks,
+                "chunks_with_pages": chunks_with_pages,  # Text chunks with additional structure
+                "summary": summary,
+                "keywords": keywords,
+                "firebase_result": firebase_result,
+                "original_file": file_name,
+                "pages_data": pages_data
             }
             
         except Exception as e:
@@ -301,6 +572,63 @@ class DocProcessor:
         # Don't forget the last chunk
         if current_chunk:
             chunks.append(current_chunk.strip())
+            
+        return chunks
+    
+    def _split_text_with_page_tracking(self, pages_data: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_SIZE) -> List[Dict[str, Any]]:
+        """
+        Split text from pages into manageable chunks.
+        
+        Splits text by sentences to maintain semantic coherence within chunks.
+        Each chunk aims for approximately chunk_size characters.
+        
+        Args:
+            pages_data: List of dictionaries containing page_number and text
+            chunk_size: Target size for each chunk in characters
+            
+        Returns:
+            List of dictionaries containing text chunks
+        """
+        if not pages_data:
+            return []
+            
+        chunks = []
+        current_chunk = ""
+        
+        for page_data in pages_data:
+            page_num = page_data["page_number"]
+            page_text = page_data["text"]
+            
+            if not page_text or not page_text.strip():
+                continue
+                
+            # Clean the page text
+            page_text = self._clean_extracted_text(page_text)
+            
+            # Split by sentences to maintain semantic boundaries
+            sentences = page_text.replace('\n', ' ').split('. ')
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                    
+                # Check if adding this sentence would exceed chunk size
+                if len(current_chunk) + len(sentence) < chunk_size:
+                    current_chunk += sentence + ". "
+                else:
+                    # Save current chunk and start new one
+                    if current_chunk:
+                        chunks.append({
+                            "text": current_chunk.strip()
+                        })
+                    current_chunk = sentence + ". "
+        
+        # Don't forget the last chunk
+        if current_chunk:
+            chunks.append({
+                "text": current_chunk.strip()
+            })
             
         return chunks
     
@@ -472,4 +800,38 @@ class DocProcessor:
                 "message": f"Error generating global summary: {str(e)}"
             }
         
-    
+    def parse_modules_with_openai(self, text):
+        """Verwendet GPT-4o-mini, um Module und Felder zu extrahieren."""
+        prompt = f"""
+        Du bist ein Assistent, der Modulbeschreibungen aus einem PDF-Text analysiert. Extrahiere alle Module und fülle für jedes Modul die folgenden Felder aus:
+        - Modulnummer
+        - Modulname
+        - Lehrinhalte
+        - Empfohlene Vorkenntnisse
+        - Teilnahmevoraussetzungen
+        - Leistungspunkte/ECTS
+        - Workload
+        - Modulbeauftragte
+        - Literaturangaben
+        - Studiengang
+        - Modulbeschreibung
+
+
+        Gib die Ergebnisse als JSON-Array zurück, wobei jedes Modul ein JSON-Objekt mit den oben genannten Feldern ist. Wenn ein Feld nicht im Text gefunden wird, setze es auf "". Ignoriere irrelevante Informationen und achte auf typische Formulierungen in Modulhandbüchern. Hier ist der Text:
+
+        {text}
+        """
+
+        response = self._openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Du bist ein präziser Datenextraktor für Modulbeschreibungen."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        # Extrahiere die JSON-Antwort
+        result = json.loads(response.choices[0].message.content)
+        return result.get("modules", [])
+        

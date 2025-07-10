@@ -1,17 +1,15 @@
-import pdfplumber
 import os
-import io
 from typing import Dict, List, Any, Optional, Tuple
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
 from crewai import Agent, Task, Crew
 from crewai.tools import tool
-from pinecone import Pinecone
-from langchain_pinecone import PineconeVectorStore
 from firebase_connection import FirebaseConnection
+from doc_processor import DocProcessor
+from vector_manager import VectorManager
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 import json
@@ -21,9 +19,8 @@ import traceback
 load_dotenv()
 
 # Constants
-EMBEDDING_MODEL = "text-embedding-ada-002"
 DEFAULT_CHUNK_SIZE = 2000
-DEFAULT_CHUNK_OVERLAP = 500  # Reduced to 100-200 token range (roughly 150 characters)
+DEFAULT_CHUNK_OVERLAP = 150  # Reduced to 100-200 token range (roughly 150 characters)
 DEFAULT_TEMPERATURE = 0.7
 GPT_MODEL = "gpt-4.1-mini"
 
@@ -66,12 +63,11 @@ class AgentProcessor:
         self._pinecone_api_key = pinecone_api_key
         self._index_name = index_name
         
-        # Initialize Pinecone
-        self._pc = Pinecone(api_key=pinecone_api_key)
-        
-        # Initialize OpenAI components
+        # Initialize OpenAI LLM
         self._llm = ChatOpenAI(api_key=openai_api_key, model=GPT_MODEL, temperature=DEFAULT_TEMPERATURE)
-        self._embeddings = OpenAIEmbeddings(api_key=openai_api_key, model=EMBEDDING_MODEL)
+        
+        # Initialize VectorManager for all vector operations
+        self._vector_manager = VectorManager(pinecone_api_key, openai_api_key, index_name)
         
         # Initialize text splitter
         self._text_splitter = RecursiveCharacterTextSplitter(
@@ -89,63 +85,16 @@ class AgentProcessor:
             print(f"Firebase nicht verfügbar: {e}")
             self._firebase_available = False
         
-        # Initialize vectorstore (will be set up per namespace)
-        self._vectorstores = {}
+        # Initialize DocProcessor for PDF processing
+        self._doc_processor = DocProcessor(pinecone_api_key, openai_api_key)
+        
+        # Initialize agents cache
         self._agents = {}
 
-    def extract_pdf(self, file_content: bytes) -> Optional[Dict[str, Any]]:
-        """
-        Extract text and metadata from PDF content using pdfplumber.
-        
-        Args:
-            file_content: Raw PDF file content as bytes
-            
-        Returns:
-            Dict containing extracted text and metadata, or None if extraction fails
-        """
-        try:
-            pdf_file = io.BytesIO(file_content)
-            with pdfplumber.open(pdf_file) as pdf:
-                text = "".join(page.extract_text() or "" for page in pdf.pages)
-                metadata = pdf.metadata if hasattr(pdf, 'metadata') else {}
-            return {"text": text, "metadata": metadata}
-        except Exception as e:
-            print(f"Fehler beim PDF-Verarbeiten: {e}")
-            return None
 
-    def process_pdf_content(self, pdf_data: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
-        """
-        Process extracted PDF content by chunking and summarizing.
-        
-        Args:
-            pdf_data: Dictionary containing text and metadata from PDF
-            filename: Original filename for identification
-            
-        Returns:
-            Dict containing processed chunks and summary, or None if processing fails
-        """
-        if not pdf_data or not pdf_data.get("text"):
-            return None
-        
-        try:
-            # Split text into chunks
-            chunks = self._text_splitter.split_text(pdf_data["text"])
-            
-            # Generate summary
-            summary_prompt = f"Fasse diesen Text zusammen (max. 1000 Zeichen): {pdf_data['text'][:10000]}"
-            summary = self._llm.invoke(summary_prompt).content
-            
-            return {
-                "pdf_id": filename,
-                "chunks": chunks,
-                "summary": summary,
-                "metadata": pdf_data["metadata"]
-            }
-        except Exception as e:
-            print(f"Fehler beim Verarbeiten der PDF-Inhalte: {e}")
-            return None
 
-    def setup_vectorstore(self, namespace: str) -> PineconeVectorStore:
+
+    def setup_vectorstore(self, namespace: str):
         """
         Set up or retrieve vectorstore for a specific namespace.
         
@@ -155,21 +104,7 @@ class AgentProcessor:
         Returns:
             PineconeVectorStore vectorstore instance
         """
-        if namespace in self._vectorstores:
-            return self._vectorstores[namespace]
-        
-        # Ensure index exists
-        self._ensure_index_exists()
-        
-        # Create vectorstore for this namespace
-        vectorstore = PineconeVectorStore.from_existing_index(
-            index_name=self._index_name, 
-            embedding=self._embeddings,
-            namespace=namespace
-        )
-        
-        self._vectorstores[namespace] = vectorstore
-        return vectorstore
+        return self._vector_manager.setup_vectorstore(namespace)
 
     def get_adjacent_chunks(self, namespace: str, chunk_id: str) -> Dict[str, str]:
         """
@@ -182,63 +117,7 @@ class AgentProcessor:
         Returns:
             Dict containing previous, current, and next chunk content
         """
-        try:
-            index = self._pc.Index(self._index_name)
-            
-            # Parse chunk ID to get document ID and chunk number
-            if "_chunk_" not in chunk_id:
-                return {"current": None, "previous": None, "next": None}
-            
-            parts = chunk_id.split("_chunk_")
-            if len(parts) != 2:
-                return {"current": None, "previous": None, "next": None}
-            
-            file_id = parts[0]
-            try:
-                chunk_num = int(parts[1])
-            except ValueError:
-                return {"current": None, "previous": None, "next": None}
-            
-            # Construct IDs for adjacent chunks
-            prev_id = f"{file_id}_chunk_{chunk_num - 1}" if chunk_num > 0 else None
-            next_id = f"{file_id}_chunk_{chunk_num + 1}"
-            
-            # Fetch chunks from Pinecone
-            result = {"current": None, "previous": None, "next": None}
-            
-            # Get current chunk
-            try:
-                current_response = index.fetch(ids=[chunk_id], namespace=namespace)
-                if chunk_id in current_response.get('vectors', {}):
-                    current_metadata = current_response['vectors'][chunk_id].get('metadata', {})
-                    # Note: Pinecone doesn't store the actual text in fetch, only metadata
-                    # We'll need to use the vectorstore to get the actual content
-                    result["current"] = chunk_id
-            except Exception as e:
-                print(f"❌ Error fetching current chunk {chunk_id}: {e}")
-            
-            # Get previous chunk
-            if prev_id:
-                try:
-                    prev_response = index.fetch(ids=[prev_id], namespace=namespace)
-                    if prev_id in prev_response.get('vectors', {}):
-                        result["previous"] = prev_id
-                except Exception as e:
-                    print(f"⚠️  Previous chunk {prev_id} not found: {e}")
-            
-            # Get next chunk
-            try:
-                next_response = index.fetch(ids=[next_id], namespace=namespace)
-                if next_id in next_response.get('vectors', {}):
-                    result["next"] = next_id
-            except Exception as e:
-                print(f"⚠️  Next chunk {next_id} not found: {e}")
-            
-            return result
-            
-        except Exception as e:
-            print(f"❌ Error in get_adjacent_chunks: {e}")
-            return {"current": None, "previous": None, "next": None}
+        return self._vector_manager.get_adjacent_chunks(namespace, chunk_id)
 
     def get_chunk_content_by_id(self, namespace: str, chunk_id: str) -> Optional[str]:
         """
@@ -251,25 +130,7 @@ class AgentProcessor:
         Returns:
             Text content of the chunk or None if not found
         """
-        try:
-            vectorstore = self.setup_vectorstore(namespace)
-            
-            # Use similarity search with the chunk ID as metadata filter
-            # This is a workaround since Pinecone doesn't store full text in fetch
-            docs = vectorstore.similarity_search(
-                query="",  # Empty query since we're filtering by ID
-                k=1,
-                filter={"chunk_id": chunk_id.split("_chunk_")[-1]} if "_chunk_" in chunk_id else {}
-            )
-            
-            if docs and len(docs) > 0:
-                return docs[0].page_content
-            
-            return None
-            
-        except Exception as e:
-            print(f"❌ Error getting chunk content for {chunk_id}: {e}")
-            return None
+        return self._vector_manager.get_chunk_content_by_id(namespace, chunk_id)
 
     def _get_adjacent_chunks_content(self, namespace: str, doc_id: str, chunk_id: int) -> Dict[str, Optional[str]]:
         """
@@ -283,78 +144,9 @@ class AgentProcessor:
         Returns:
             Dict containing previous, current, and next chunk content
         """
-        try:
-            vectorstore = self.setup_vectorstore(namespace)
-            result = {"previous": None, "current": None, "next": None}
-            
-            # Get previous chunk (if chunk_id > 0)
-            if chunk_id > 0:
-                try:
-                    prev_docs = vectorstore.similarity_search(
-                        query="",
-                        k=50,  # Get more results to find the specific chunk
-                        filter={"document_id": doc_id, "chunk_id": chunk_id - 1}
-                    )
-                    if prev_docs and len(prev_docs) > 0:
-                        result["previous"] = prev_docs[0].page_content
-                        print(f"📄 Found previous chunk {doc_id}_chunk_{chunk_id - 1}")
-                except Exception as e:
-                    print(f"⚠️  Could not get previous chunk: {e}")
-            
-            # Get current chunk
-            try:
-                current_docs = vectorstore.similarity_search(
-                    query="",
-                    k=50,
-                    filter={"document_id": doc_id, "chunk_id": chunk_id}
-                )
-                if current_docs and len(current_docs) > 0:
-                    result["current"] = current_docs[0].page_content
-                    print(f"📄 Found current chunk {doc_id}_chunk_{chunk_id}")
-            except Exception as e:
-                print(f"⚠️  Could not get current chunk: {e}")
-            
-            # Get next chunk
-            try:
-                next_docs = vectorstore.similarity_search(
-                    query="",
-                    k=50,
-                    filter={"document_id": doc_id, "chunk_id": chunk_id + 1}
-                )
-                if next_docs and len(next_docs) > 0:
-                    result["next"] = next_docs[0].page_content
-                    print(f"📄 Found next chunk {doc_id}_chunk_{chunk_id + 1}")
-            except Exception as e:
-                print(f"⚠️  Could not get next chunk: {e}")
-            
-            return result
-            
-        except Exception as e:
-            print(f"❌ Error in _get_adjacent_chunks_content: {e}")
-            return {"previous": None, "current": None, "next": None}
+        return self._vector_manager.get_adjacent_chunks_content(namespace, doc_id, chunk_id)
 
-    def _ensure_index_exists(self):
-        """Ensure the Pinecone index exists, create if necessary."""
-        try:
-            # Check if index exists
-            existing_indexes = [idx.name for idx in self._pc.list_indexes()]
-            
-            if self._index_name not in existing_indexes:
-                from pinecone import ServerlessSpec
-                self._pc.create_index(
-                    name=self._index_name,
-                    dimension=1536,  # text-embedding-ada-002 dimension
-                    metric="cosine",
-                    spec=ServerlessSpec(
-                        cloud='aws',
-                        region='us-east-1'
-                    )
-                )
-                # Wait for index to be ready
-                import time
-                time.sleep(60)  # Wait for index initialization
-        except Exception as e:
-            print(f"Error ensuring index exists: {e}")
+
 
     def index_document(self, processed_pdf: Dict[str, Any], namespace: str, fileID: str) -> Dict[str, Any]:
         """
@@ -368,69 +160,24 @@ class AgentProcessor:
         Returns:
             Dict containing indexing status and results
         """
-        if not processed_pdf:
-            return {
-                "status": "error",
-                "message": "No processed PDF data provided"
-            }
-            
-        try:
-            vectorstore = self.setup_vectorstore(namespace)
-            
-            # Prepare texts and metadata
-            texts = processed_pdf["chunks"] + [processed_pdf["summary"]]
-            metadatas = [
-                {"pdf_id": fileID, "document_id": fileID, "type": "chunk", "chunk_id": i} 
-                for i in range(len(processed_pdf["chunks"]))
-            ] + [{"pdf_id": fileID, "document_id": fileID, "type": "summary"}]
-            
-            # Add texts to vectorstore with retry mechanism
-            ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"]
-            
-            print(f"📤 Indexing {len(texts)} texts for document {fileID}")
-            print(f"📊 Text lengths: {[len(text) for text in texts[:5]]}...")  # Show first 5 lengths
-            
-            # Retry mechanism for Pinecone upload
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
-                    print(f"✅ Successfully indexed document {fileID} on attempt {attempt + 1}")
-                    break
-                except Exception as upload_error:
-                    print(f"❌ Attempt {attempt + 1} failed: {str(upload_error)}")
-                    if attempt == max_retries - 1:
-                        raise upload_error
-                    
-                    # Wait before retry (exponential backoff)
-                    import time
-                    wait_time = 2 ** attempt
-                    print(f"⏳ Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-            # Speichere die IDs in Firebase
-            if self._firebase_available:
-                self._firebase.append_metadata(
-                    namespace=namespace,
-                    fileID=fileID,
-                    chunk_count=len(processed_pdf["chunks"]),
-                    keywords=[],
-                    summary=processed_pdf["summary"],
-                    vector_ids=ids
-                )
-            
-            return {
-                "status": "success",
-                "message": f"Document {fileID} indexed successfully",
-                "chunks": len(processed_pdf["chunks"])
-            }
-            
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Error indexing document: {str(e)}"
-            }
+        # Delegate to vector manager
+        indexing_result = self._vector_manager.index_document(processed_pdf, namespace, fileID)
+        
+        # If indexing was successful, also save to Firebase
+        if indexing_result["status"] == "success" and self._firebase_available:
+            vector_ids = indexing_result.get("vector_ids", [])
+            self._firebase.append_metadata(
+                namespace=namespace,
+                fileID=fileID,
+                chunk_count=len(processed_pdf["chunks"]),
+                keywords=[],
+                summary=processed_pdf["summary"],
+                vector_ids=vector_ids
+            )
+        
+        return indexing_result
 
-    def setup_agent(self, namespace: str) -> Tuple[Agent, PineconeVectorStore]:
+    def setup_agent(self, namespace: str) -> Tuple[Agent, Any]:
         """
         Set up CrewAI agent with RAG capabilities for a specific namespace.
         
@@ -441,9 +188,12 @@ class AgentProcessor:
             Tuple containing the configured agent and vectorstore
         """
         if namespace in self._agents:
-            return self._agents[namespace], self._vectorstores[namespace]
+            return self._agents[namespace], self._vector_manager.get_vectorstore(namespace)
         
         vectorstore = self.setup_vectorstore(namespace)
+        
+        # Get document overview for the system prompt
+        documents_overview = self._get_documents_overview_for_prompt(namespace)
         
         # Multi-Query-Retriever
         pdf_retriever = MultiQueryRetriever.from_llm(
@@ -595,6 +345,8 @@ class AgentProcessor:
                         
                         found_doc_ids.add(doc_id)
                         
+                        # Page information no longer tracked
+                        
                         # Try to get adjacent chunks if we have chunk metadata
                         if chunk_id is not None and isinstance(chunk_id, int):
                             try:
@@ -670,18 +422,24 @@ class AgentProcessor:
         # Agent definieren
         researcher = Agent(
             role="Studienberater",
-            goal="Hilf Studierenden bei ihren Fragen. Wenn etwas unklar ist, frage kurz nach.",
-            backstory="""Du bist ein freundlicher Studienberater. Antworte direkt auf Fragen und frage nur bei wirklich nötigen Informationen kurz nach.
-            
-            VERHALTEN:
-            - Antworte direkt mit den verfügbaren Informationen
-            - Wenn etwas unklar ist: Eine kurze, einfache Nachfrage
-            - Beispiel: "Welcher Studiengang?" oder "Welches Semester?"
-            - Arbeite mit dem was du hast, auch wenn es nicht perfekt ist
-            
-            Du hast zwei Tools zur Verfügung:
-            1. Document Overview Tool - um zu sehen welche Dokumente verfügbar sind  
-            2. PDF Search Tool - um in spezifischen oder allen Dokumenten zu suchen""",
+            goal="Hilf Studierenden bei ihren Fragen zu den verfügbaren Dokumenten. Sage direkt wenn du keine Informationen zu einem Thema hast.",
+            backstory=f"""Du bist ein freundlicher Studienberater mit Zugang zu spezifischen Dokumenten. Du bist ehrlich über deine Grenzen.
+
+            {documents_overview}
+
+            WICHTIGE VERHALTENSREGELN:
+            - Du kennst NUR die oben aufgelisteten Dokumente
+            - Sage SOFORT wenn du zu einem Thema keine Informationen hast
+            - Beispiel: "Zu diesem Thema habe ich leider keine Informationen in meinen verfügbaren Dokumenten."
+            - Erfinde NIEMALS Informationen
+            - Verwende deine Tools aktiv um in den Dokumenten zu suchen
+            - Bei unklaren Fragen: Stelle eine kurze Rückfrage ("Welcher Studiengang?" oder "Welches Semester?")
+
+            DEINE TOOLS:
+            1. Document Overview Tool - zeigt aktuelle Dokumentenliste (nutze das wenn nach "verfügbaren Dokumenten" gefragt wird)
+            2. PDF Search Tool - durchsucht die Dokumente nach spezifischen Informationen
+
+            WICHTIG: Wenn eine Frage außerhalb deiner verfügbaren Dokumente liegt, sage das ehrlich und direkt!""",
             llm=self._llm,
             tools=[document_overview_tool, pdf_search_tool],
             verbose=False,  # Disable verbose to avoid parsing issues
@@ -690,6 +448,45 @@ class AgentProcessor:
         
         self._agents[namespace] = researcher
         return researcher, vectorstore
+
+    def _get_documents_overview_for_prompt(self, namespace: str) -> str:
+        """
+        Get a compact overview of available documents for the system prompt.
+        
+        Args:
+            namespace: Namespace identifier
+            
+        Returns:
+            String containing document overview for system prompt
+        """
+        try:
+            summary_data = self.get_namespace_summary(namespace)
+            
+            if summary_data["status"] != "success" or summary_data["document_count"] == 0:
+                return "KEINE DOKUMENTE VERFÜGBAR - Du hast aktuell keinen Zugang zu Dokumenten in diesem Namespace."
+            
+            overview_parts = [
+                f"📚 VERFÜGBARE DOKUMENTE IN DIESEM NAMESPACE ({summary_data['document_count']} Dokumente):",
+            ]
+            
+            for doc in summary_data["documents"]:
+                doc_summary = doc['summary'][:150] + ("..." if len(doc['summary']) > 150 else "")
+                overview_parts.append(f"• ID: {doc['id']} | Name: {doc.get('name', doc['id'])} | Thema: {doc_summary}")
+            
+            overview_parts.extend([
+                "",
+                "🎯 DEINE AUFGABEN:",
+                "- Beantworte Fragen NUR basierend auf diesen verfügbaren Dokumenten",
+                "- Sage DIREKT wenn du zu einem Thema keine Informationen hast",
+                "- Nutze das Document Overview Tool für allgemeine Übersichten",
+                "- Nutze das PDF Search Tool für spezifische Suchen",
+                "- Sei ehrlich über deine Grenzen - erfinde keine Informationen"
+            ])
+            
+            return "\n".join(overview_parts)
+            
+        except Exception as e:
+            return f"FEHLER beim Laden der Dokumentübersicht: {str(e)}"
 
     def answer_question(self, question: str, namespace: str, chat_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """
@@ -915,7 +712,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 "additional_info": f"Fehler aufgetreten: {type(e).__name__}"
             }
 
-    def process_document_full(self, file_content: bytes, namespace: str, fileID: str, filename: str) -> Dict[str, Any]:
+    def process_document_full(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false") -> Dict[str, Any]:
         """
         Complete document processing pipeline from PDF to indexed content.
         
@@ -924,21 +721,22 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             namespace: Namespace for organization
             fileID: Unique document identifier
             filename: Original filename
+            hasTablesOrGraphics: Whether PDF has tables/graphics requiring page-based chunking
             
         Returns:
             Dict containing processing results and status
         """
         try:
-            # Step 1: Extract PDF content
-            pdf_data = self.extract_pdf(file_content)
+            # Step 1: Extract PDF content using DocProcessor
+            pdf_data = self._doc_processor.extract_pdf(file_content, hasTablesOrGraphics)
             if not pdf_data:
                 return {
                     "status": "error",
                     "message": "Failed to extract PDF content"
                 }
             
-            # Step 2: Process content (chunk and summarize)
-            processed_pdf = self.process_pdf_content(pdf_data, filename)
+            # Step 2: Process content (chunk and summarize) using DocProcessor
+            processed_pdf = self._doc_processor.process_pdf_content(pdf_data, filename, hasTablesOrGraphics)
             if not processed_pdf:
                 return {
                     "status": "error",
@@ -976,36 +774,34 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             }
 
     def delete_document(self, namespace: str, fileID: str) -> Dict[str, Any]:
-        pinecone_deleted = False
+        """
+        Delete a document from both vector database and Firebase.
+        
+        Args:
+            namespace: Namespace containing the document
+            fileID: Document ID to delete
+            
+        Returns:
+            Dict containing deletion status
+        """
+        # Delete from vector database
+        vector_result = self._vector_manager.delete_document(namespace, fileID)
+        pinecone_deleted = vector_result.get("status") == "success"
+        
+        # Delete from Firebase
         firebase_deleted = False
-        try:
-            index = self._pc.Index(self._index_name)
-            index.delete(
-            filter={
-                "pdf_id": {"$eq": fileID}
-            },
-            namespace=namespace
-            )
-            pinecone_deleted = True
-            
-            # Firebase-Löschung immer ausführen!
-            firebase_result = {"status": "success", "message": "Firebase not available"}
-            if self._firebase_available:
-                firebase_result = self._firebase.delete_document_metadata(namespace, fileID)
-                if firebase_result.get("status") == "success":
-                    firebase_deleted = True
-            
-            return {
-                "status": "success",
-                "message": f"Document {fileID} deleted. Pinecone: {pinecone_deleted}, Firebase: {firebase_deleted}"
-            }
-        except Exception as e:
-            logger.error(f"Fehler beim Löschen des Dokuments {fileID} im Namespace {namespace}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return {
-                "status": "error",
-                "message": f"Error deleting document: {str(e)}"
-            }
+        firebase_result = {"status": "success", "message": "Firebase not available"}
+        if self._firebase_available:
+            firebase_result = self._firebase.delete_document_metadata(namespace, fileID)
+            if firebase_result.get("status") == "success":
+                firebase_deleted = True
+        
+        return {
+            "status": "success" if pinecone_deleted else "error",
+            "message": f"Document {fileID} deletion - Pinecone: {pinecone_deleted}, Firebase: {firebase_deleted}",
+            "vector_result": vector_result,
+            "firebase_result": firebase_result
+        }
 
     def delete_namespace(self, namespace: str) -> Dict[str, Any]:
         """
@@ -1017,48 +813,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
         Returns:
             A dictionary with the status of the operation.
         """
-        try:
-            index = self._pc.Index(self._index_name)
-            
-            # First check if namespace exists by trying to get stats
-            try:
-                stats = index.describe_index_stats()
-                namespaces = stats.get('namespaces', {})
-                
-                if namespace not in namespaces:
-                    return {
-                        "status": "success",
-                        "message": f"Namespace {namespace} does not exist - nothing to delete."
-                    }
-                
-                # If namespace exists, proceed with deletion
-                index.delete(namespace=namespace, delete_all=True)
-                return {
-                    "status": "success",
-                    "message": f"Namespace {namespace} deleted from Pinecone."
-                }
-                
-            except Exception as check_error:
-                # If we can't check namespace existence, try deletion anyway
-                # This handles cases where the index might exist but be empty
-                index.delete(namespace=namespace, delete_all=True)
-                return {
-                    "status": "success",
-                    "message": f"Namespace {namespace} deletion attempted (existence check failed but deletion succeeded)."
-                }
-                
-        except Exception as e:
-            error_message = str(e)
-            # Handle 404 errors more gracefully
-            if "404" in error_message or "Not Found" in error_message:
-                return {
-                    "status": "success",
-                    "message": f"Namespace {namespace} does not exist - nothing to delete."
-                }
-            return {
-                "status": "error",
-                "message": f"Error deleting namespace from Pinecone: {error_message}"
-            }
+        return self._vector_manager.delete_namespace(namespace)
 
     def get_namespace_summary(self, namespace: str):
         """
