@@ -5,11 +5,13 @@ from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from dotenv import load_dotenv
 import logging
+import math
 
 load_dotenv()
 
 # Constants
 EMBEDDING_MODEL = "text-embedding-ada-002"
+DEFAULT_BATCH_SIZE = 5  # Further reduced batch size for Pinecone uploads to prevent 2MB limit
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,7 @@ class VectorManager:
     for the document processing pipeline.
     """
     
-    def __init__(self, pinecone_api_key: str, openai_api_key: str, index_name: str = "pdfs-index"):
+    def __init__(self, pinecone_api_key: str, openai_api_key: str, index_name: str = "pdfs-index", batch_size: int = DEFAULT_BATCH_SIZE):
         """
         Initialize VectorManager with API keys and connections.
         
@@ -30,6 +32,7 @@ class VectorManager:
             pinecone_api_key: API key for Pinecone vector database
             openai_api_key: API key for OpenAI embeddings
             index_name: Name of the Pinecone index
+            batch_size: Maximum number of vectors to upload per batch
             
         Raises:
             ValueError: If required API keys are missing
@@ -40,6 +43,7 @@ class VectorManager:
         self._pinecone_api_key = pinecone_api_key
         self._openai_api_key = openai_api_key
         self._index_name = index_name
+        self._batch_size = batch_size
         
         # Initialize Pinecone
         self._pc = Pinecone(api_key=pinecone_api_key)
@@ -52,56 +56,134 @@ class VectorManager:
         
         # Ensure index exists
         self._ensure_index_exists()
+        
+        logger.info(f"VectorManager initialized with batch_size: {batch_size}")
 
     def _ensure_index_exists(self):
-        """Ensure the Pinecone index exists, create if necessary."""
+        """
+        Ensure the Pinecone index exists, create if it doesn't.
+        """
         try:
-            # Check if index exists
-            existing_indexes = [idx.name for idx in self._pc.list_indexes()]
-            
+            existing_indexes = [index.name for index in self._pc.list_indexes()]
             if self._index_name not in existing_indexes:
-                from pinecone import ServerlessSpec
                 self._pc.create_index(
                     name=self._index_name,
-                    dimension=1536,  # text-embedding-ada-002 dimension
-                    metric="cosine",
-                    spec=ServerlessSpec(
-                        cloud='aws',
-                        region='us-east-1'
-                    )
+                    dimension=1536,  # OpenAI embedding dimension
+                    metric='cosine',
+                    spec={
+                        'serverless': {
+                            'cloud': 'aws',
+                            'region': 'us-east-1'
+                        }
+                    }
                 )
-                # Wait for index to be ready
-                import time
-                time.sleep(60)  # Wait for index initialization
+                logger.info(f"Created new Pinecone index: {self._index_name}")
+            else:
+                logger.info(f"Using existing Pinecone index: {self._index_name}")
         except Exception as e:
             logger.error(f"Error ensuring index exists: {e}")
+            raise
 
     def setup_vectorstore(self, namespace: str) -> PineconeVectorStore:
         """
-        Set up or retrieve vectorstore for a specific namespace.
+        Set up vectorstore for a specific namespace.
         
         Args:
             namespace: Namespace identifier
             
         Returns:
-            PineconeVectorStore vectorstore instance
+            PineconeVectorStore instance for the namespace
         """
-        if namespace in self._vectorstores:
-            return self._vectorstores[namespace]
+        if namespace not in self._vectorstores:
+            self._vectorstores[namespace] = PineconeVectorStore(
+                index_name=self._index_name,
+                embedding=self._embeddings,
+                namespace=namespace,
+                pinecone_api_key=self._pinecone_api_key
+            )
+        return self._vectorstores[namespace]
+
+    def _batch_upload_texts(self, vectorstore: PineconeVectorStore, texts: List[str], metadatas: List[Dict], ids: List[str]) -> None:
+        """
+        Upload texts to Pinecone in batches to avoid exceeding size limits.
         
-        # Create vectorstore for this namespace
-        vectorstore = PineconeVectorStore.from_existing_index(
-            index_name=self._index_name, 
-            embedding=self._embeddings,
-            namespace=namespace
-        )
+        Args:
+            vectorstore: PineconeVectorStore instance
+            texts: List of text chunks to upload
+            metadatas: List of metadata dictionaries
+            ids: List of unique IDs for each text
+            
+        Raises:
+            Exception: If any batch upload fails
+        """
+        total_items = len(texts)
+        num_batches = math.ceil(total_items / self._batch_size)
         
-        self._vectorstores[namespace] = vectorstore
-        return vectorstore
+        # Calculate total estimated size
+        total_size_estimate = sum(len(text) for text in texts) + sum(len(str(meta)) for meta in metadatas)
+        print(f"📤 Starting batch upload: {total_items} items in {num_batches} batches (batch_size: {self._batch_size})")
+        print(f"📊 Total estimated size: ~{total_size_estimate/1024/1024:.2f} MB")
+        
+        successful_batches = 0
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * self._batch_size
+            end_idx = min((batch_idx + 1) * self._batch_size, total_items)
+            
+            batch_texts = texts[start_idx:end_idx]
+            batch_metadatas = metadatas[start_idx:end_idx]
+            batch_ids = ids[start_idx:end_idx]
+            
+            print(f"📦 Uploading batch {batch_idx + 1}/{num_batches}: items {start_idx}-{end_idx-1} ({len(batch_texts)} items)")
+            
+            # Calculate approximate batch size for logging
+            batch_size_estimate = sum(len(text) for text in batch_texts) + sum(len(str(meta)) for meta in batch_metadatas)
+            print(f"📊 Estimated batch size: ~{batch_size_estimate/1024:.1f} KB (~{batch_size_estimate/1024/1024:.3f} MB)")
+            
+            # Validate batch size isn't too large
+            if batch_size_estimate > 1.5 * 1024 * 1024:  # 1.5MB warning
+                print(f"⚠️  WARNING: Batch size {batch_size_estimate/1024/1024:.2f} MB is close to 2MB limit!")
+            
+            max_retries = 3
+            batch_success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    print(f"🔄 Attempting upload batch {batch_idx + 1}/{num_batches}, attempt {attempt + 1}/{max_retries}")
+                    vectorstore.add_texts(texts=batch_texts, metadatas=batch_metadatas, ids=batch_ids)
+                    print(f"✅ Successfully uploaded batch {batch_idx + 1}/{num_batches} on attempt {attempt + 1}")
+                    batch_success = True
+                    successful_batches += 1
+                    break
+                except Exception as upload_error:
+                    error_msg = str(upload_error)
+                    print(f"❌ Batch {batch_idx + 1} attempt {attempt + 1} failed: {error_msg}")
+                    
+                    # Check if it's a size-related error
+                    if "exceeds the maximum supported size" in error_msg:
+                        print(f"🚨 SIZE LIMIT ERROR: Batch {batch_idx + 1} is too large even with batch_size={self._batch_size}")
+                        print(f"🔧 Consider reducing batch_size further or optimizing text content")
+                    
+                    if attempt == max_retries - 1:
+                        print(f"💥 FAILED: Batch {batch_idx + 1} failed after {max_retries} attempts")
+                        raise Exception(f"Failed to upload batch {batch_idx + 1} after {max_retries} attempts: {error_msg}")
+                    
+                    # Wait before retry (exponential backoff)
+                    import time
+                    wait_time = 2 ** attempt
+                    print(f"⏳ Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+            
+            if not batch_success:
+                raise Exception(f"Failed to upload batch {batch_idx + 1}")
+        
+        print(f"🎉 SUCCESS: All {successful_batches}/{num_batches} batches uploaded successfully!")
+        print(f"📈 Total items processed: {total_items}")
+        print(f"📊 Final batch configuration: batch_size={self._batch_size}, total_batches={num_batches}")
 
     def index_document(self, processed_pdf: Dict[str, Any], namespace: str, fileID: str) -> Dict[str, Any]:
         """
-        Index processed PDF content in Pinecone vectorstore.
+        Index processed PDF content in Pinecone vectorstore with batch uploading.
         
         Args:
             processed_pdf: Dictionary containing chunks, summary, and metadata
@@ -127,66 +209,62 @@ class VectorManager:
             metadatas = []
             chunks_with_pages = processed_pdf.get("chunks_with_pages", [])
             
-            for i in range(len(processed_pdf["chunks"])):
-                metadata = {
-                    "pdf_id": fileID, 
-                    "document_id": fileID, 
-                    "type": "chunk", 
+            # Create metadata for chunks
+            for i, chunk in enumerate(processed_pdf["chunks"]):
+                chunk_metadata = {
+                    "document_id": fileID,
                     "chunk_id": i,
-                    "is_special_vector": False
+                    "original_filename": processed_pdf.get("original_file", "unknown"),
+                    "chunk_type": "content"
                 }
                 
-                # Add page information if available from chunks_with_pages
-                if chunks_with_pages and i < len(chunks_with_pages):
-                    chunk_data = chunks_with_pages[i]
-                    if "pages" in chunk_data:
-                        metadata["pages"] = chunk_data["pages"]
-                        metadata["page_range"] = chunk_data["page_range"]
-                        metadata["first_page"] = min(chunk_data["pages"])
-                        metadata["last_page"] = max(chunk_data["pages"])
-                        print(f"📄 Chunk {i}: pages {chunk_data['page_range']}")
+                # Add page information if available
+                if i < len(chunks_with_pages):
+                    chunk_with_page = chunks_with_pages[i]
+                    if "pages" in chunk_with_page and chunk_with_page["pages"]:
+                        # Convert pages to strings for Pinecone compatibility
+                        pages_as_strings = [str(int(page)) for page in chunk_with_page["pages"]]
+                        chunk_metadata["pages"] = pages_as_strings
+                        chunk_metadata["page_range"] = f"{min(chunk_with_page['pages'])}-{max(chunk_with_page['pages'])}"
                 
-                metadatas.append(metadata)
+                metadatas.append(chunk_metadata)
             
-            # Add summary metadata
-            metadatas.append({
-                "pdf_id": fileID, 
-                "document_id": fileID, 
-                "type": "summary",
-                "is_special_vector": False
-            })
+            # Metadata for summary
+            summary_metadata = {
+                "document_id": fileID,
+                "chunk_id": "summary",
+                "original_filename": processed_pdf.get("original_file", "unknown"),
+                "chunk_type": "summary"
+            }
+            metadatas.append(summary_metadata)
             
-            # Prepare special pages data if available
+            # Handle special pages processing for image-based content
             special_pages_texts = []
             special_pages_metadatas = []
             special_pages_ids = []
             
-            if processed_pdf.get("special_pages_data"):
+            # Process special pages if available
+            if "special_pages_data" in processed_pdf:
                 special_pages_data = processed_pdf["special_pages_data"]
-                print(f"📸 Creating {len(special_pages_data)} ADDITIONAL vectors for special pages (these are extra, not replacements)")
+                print(f"📸 Processing {len(special_pages_data)} special pages for enhanced indexing")
                 
-                for i, page_data in enumerate(special_pages_data):
-                    # Create text content combining image info and text
-                    special_text = f"ENHANCED PAGE {page_data['page_number']} (OPENAI VISION):\n"
-                    special_text += f"Base64 Image Data: {page_data['image_base64'][:100]}...\n"
-                    special_text += f"OpenAI Vision Extracted Text:\n{page_data['text']}"
+                for page_data in special_pages_data:
+                    page_num = page_data["page_number"]
+                    enhanced_text = page_data["enhanced_text"]
                     
-                    special_pages_texts.append(special_text)
-                    special_pages_metadatas.append({
-                        "pdf_id": fileID,
-                        "document_id": fileID,
-                        "type": "special_page",
-                        "page_number": page_data["page_number"],
-                        "image_format": page_data["image_format"],
-                        "image_size": page_data["image_size"],
-                        "text_length": page_data["text_length"],
-                        "has_image": True,
-                        "is_special_vector": True,
-                        "extracted_with_openai": page_data.get("extracted_with_openai", False)
-                    })
-                    special_pages_ids.append(f"{fileID}_special_page_{page_data['page_number']}")
+                    if enhanced_text and enhanced_text.strip():
+                        special_pages_texts.append(enhanced_text)
+                        special_pages_metadatas.append({
+                            "document_id": fileID,
+                            "chunk_id": f"special_page_{page_num}",
+                            "original_filename": processed_pdf.get("original_file", "unknown"),
+                            "chunk_type": "special_page",
+                            "page_number": page_num,
+                            "enhanced_content": True
+                        })
+                        special_pages_ids.append(f"{fileID}_special_page_{page_num}")
             
-            # Combine regular and special page content
+            # Combine all data
             all_texts = texts + special_pages_texts
             all_metadatas = metadatas + special_pages_metadatas
             all_ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"] + special_pages_ids
@@ -197,32 +275,19 @@ class VectorManager:
                 print(f"📄 Normal chunks with page tracking: {len([c for c in chunks_with_pages if 'pages' in c])}")
             print(f"📸 Additional enhanced page vectors: {len(special_pages_texts)}")
             
-            # Retry mechanism for Pinecone upload
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    vectorstore.add_texts(texts=all_texts, metadatas=all_metadatas, ids=all_ids)
-                    print(f"✅ Successfully indexed document {fileID} on attempt {attempt + 1}")
-                    if special_pages_texts:
-                        print(f"📸 Successfully indexed {len(special_pages_texts)} ADDITIONAL special page vectors (pages exist twice now: normal + enhanced)")
-                    break
-                except Exception as upload_error:
-                    print(f"❌ Attempt {attempt + 1} failed: {str(upload_error)}")
-                    if attempt == max_retries - 1:
-                        raise upload_error
-                    
-                    # Wait before retry (exponential backoff)
-                    import time
-                    wait_time = 2 ** attempt
-                    print(f"⏳ Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
+            # Use batch upload to prevent exceeding Pinecone's 2MB limit
+            self._batch_upload_texts(vectorstore, all_texts, all_metadatas, all_ids)
+            
+            if special_pages_texts:
+                print(f"📸 Successfully indexed {len(special_pages_texts)} ADDITIONAL special page vectors (pages exist twice now: normal + enhanced)")
             
             return {
                 "status": "success",
-                "message": f"Document {fileID} indexed successfully",
+                "message": f"Document {fileID} indexed successfully with batch upload",
                 "chunks": len(processed_pdf["chunks"]),
                 "special_pages": len(special_pages_texts),
-                "vector_ids": all_ids
+                "vector_ids": all_ids,
+                "batches_used": math.ceil(len(all_texts) / self._batch_size)
             }
             
         except Exception as e:

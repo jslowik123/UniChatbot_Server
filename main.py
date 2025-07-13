@@ -11,7 +11,7 @@ from agent_processor import AgentProcessor
 from agent_chatbot import get_bot, message_bot_agent
 from firebase_connection import FirebaseConnection
 from celery_app import test_task, celery
-from tasks import process_document, generate_assessment
+from tasks import process_document, generate_assessment, generate_example_questions_task
 from assessment_service import AssessmentService
 from redis import Redis
 import json
@@ -138,6 +138,9 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         
         task = process_document.delay(content, namespace, fileID, file.filename, hasTablesOrGraphics, special_pages)
         
+        # Automatically generate example questions after document upload
+        generate_example_questions_task.delay(namespace)
+        
         return {
             "status": "success",
             "message": "File upload started - will be processed with CrewAI agents",
@@ -176,6 +179,9 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
             # Trigger assessment update after deletion
             generate_assessment.delay(namespace)
             
+            # Automatically generate example questions after document deletion
+            generate_example_questions_task.delay(namespace)
+            
             return {
                 "status": result["status"], 
                 "message": result["message"],
@@ -187,6 +193,9 @@ async def delete_file(file_name: str = Form(...), namespace: str = Form(...),
             
             # Trigger assessment update after deletion
             generate_assessment.delay(namespace)
+            
+            # Automatically generate example questions after document deletion
+            generate_example_questions_task.delay(namespace)
             
             return {
                 "status": result["status"], 
@@ -260,64 +269,35 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
             }
         }
     
-    if not chat_state.agent_chatbot:
-        return {
-            "status": "error",
-            "message": "Agent bot not started. Please call /start_bot first",
-            "structured_response": {
-                "answer": "Bot nicht gestartet",
-                "document_ids": [],
-                "sources": [],
-                "confidence_score": 0.0,
-                "context_used": False,
-                "additional_info": "Bot muss zuerst gestartet werden"
-            }
-        }
-    
     try:
-        # Get or initialize chat history for this namespace
+        # Get chat history for this namespace
+        chat_history = chat_state.chat_history.get(namespace, [])
+        
+        # Get response from agent
+        response = message_bot_agent(user_input, namespace, chat_history)
+        
+        # Update chat history
         if namespace not in chat_state.chat_history:
             chat_state.chat_history[namespace] = []
         
-        history = chat_state.chat_history[namespace]
-        
-        # Add comprehensive logging
-        print(f"SEND_MESSAGE DEBUG - User input: {user_input[:100]}...")
-        print(f"SEND_MESSAGE DEBUG - Namespace: {namespace}")
-        print(f"SEND_MESSAGE DEBUG - History length: {len(history)}")
-        
-        # Use the structured message_bot function
-        structured_response = message_bot_agent(
-            user_input, namespace, history
-        )
-        
-        # Validate response structure
-        if not isinstance(structured_response, dict):
-            print(f"WARNING: Unexpected response type: {type(structured_response)}")
-            structured_response = {
-                "answer": str(structured_response),
-                "document_ids": [],
-                "sources": [],
-                "confidence_score": 0.5,
-                "context_used": False,
-                "additional_info": "Response was not in expected format"
-            }
-        
-        # Update chat history
         chat_state.chat_history[namespace].append({"role": "user", "content": user_input})
-        chat_state.chat_history[namespace].append({"role": "assistant", "content": structured_response.get("answer", "No answer")})
+        chat_state.chat_history[namespace].append({"role": "assistant", "content": response.get("answer", "")})
         
-        # Keep only last 20 messages to prevent memory overflow
-        if len(chat_state.chat_history[namespace]) > 20:
-            chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-20:]
+        # Keep only last 10 messages to prevent memory issues
+        if len(chat_state.chat_history[namespace]) > 10:
+            chat_state.chat_history[namespace] = chat_state.chat_history[namespace][-10:]
         
-        return structured_response
+        return {
+            "status": "success",
+            "message": "Agent response generated successfully",
+            "structured_response": response
+        }
         
     except Exception as e:
-        print(f"Error in send_message_structured: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return {
+            "status": "error",
+            "message": f"Error generating response: {str(e)}",
+            "structured_response": {
                 "answer": f"Fehler: {str(e)}",
                 "document_ids": [],
                 "sources": [],
@@ -325,7 +305,86 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
                 "context_used": False,
                 "additional_info": f"Exception: {type(e).__name__}"
             }
+        }
+
+
+
+@app.get("/get_example_questions/{namespace}")
+async def get_example_questions(namespace: str):
+    """
+    Get stored example questions for a namespace.
+    
+    Args:
+        namespace: Namespace to get questions for
         
+    Returns:
+        Dict containing questions and answers or generation status
+    """
+    # Input validation
+    if not namespace or not isinstance(namespace, str) or not namespace.strip():
+        return {
+            "status": "error",
+            "message": "Namespace must be a non-empty string"
+        }
+    
+    try:
+        # Initialize Firebase connection
+        try:
+            firebase_conn = FirebaseConnection()
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Firebase connection failed: {str(e)}"
+            }
+        
+        # Check generation status first
+        status_result = firebase_conn.get_example_questions_status(namespace)
+        
+        if status_result["status"] == "success":
+            generation_status = status_result["generation_status"]
+            
+            if generation_status == "generating":
+                return {
+                    "status": "generating",
+                    "message": "Fragen werden generiert"
+                }
+            elif generation_status == "error":
+                return {
+                    "status": "error",
+                    "message": "Fehler bei der Fragengenerierung"
+                }
+            elif generation_status == "completed":
+                # Get the questions
+                questions_result = firebase_conn.get_example_questions(namespace)
+                
+                if questions_result["status"] == "success":
+                    return {
+                        "status": "success",
+                        "data": questions_result["data"]
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": questions_result["message"]
+                    }
+            else:
+                # No questions generated yet
+                return {
+                    "status": "not_found",
+                    "message": "Keine Beispielfragen gefunden. Fragen werden automatisch generiert, wenn Dokumente hochgeladen werden."
+                }
+        else:
+            return {
+                "status": "error",
+                "message": f"Error checking status: {status_result['message']}"
+            }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error getting example questions: {str(e)}"
+        }
+
 
 @app.post("/create_namespace")
 async def create_namespace(namespace: str = Form(...),dimension: int = Form(DEFAULT_DIMENSION)):

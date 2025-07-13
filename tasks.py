@@ -240,3 +240,27 @@ def generate_assessment(namespace: str, additional_info: str = None):
             'status': 'error',
             'message': f"Failed to generate assessment: {str(e)}"
         }
+
+
+@celery.task(name="tasks.generate_example_questions_task")
+def generate_example_questions_task(namespace: str):
+    """
+    Generate example questions asynchronously.
+    
+    Args:
+        namespace: Namespace to generate questions for
+        
+    Returns:
+        Dict containing generation results
+    """
+    try:
+        agent_processor = AgentProcessor(
+            pinecone_api_key=os.getenv("PINECONE_API_KEY"),
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )
+        return agent_processor.generate_and_store_example_questions(namespace)
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': f"Error generating example questions: {str(e)}"
+        }

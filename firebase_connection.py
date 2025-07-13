@@ -437,19 +437,118 @@ class FirebaseConnection:
 
     def get_project_info(self, project_name: str) -> Dict[str, Any]:
         """
-        Holt die Info für ein Projekt unter projects/{project_name}/info.
+        Get project information from Firebase.
+        
+        Args:
+            project_name: Name of the project
+            
+        Returns:
+            Dict containing project information or error
         """
         try:
-            ref = self._db.reference(f'files/{project_name}/info')
-            info = ref.get()
-            ref = self._db.reference(f'files/{project_name}/assessment')
-            assessment = ref.get()
-            if info is not None:
-                return {'status': 'success', 'project_name': project_name, 'info': info, 'assessment': assessment}
+            ref = self._db.reference(f"/files/{project_name}/info")
+            data = ref.get()
+            
+            if data:
+                return {"status": "success", "data": data}
             else:
-                return {'status': 'not_found', 'message': f'Keine Info für Projekt {project_name} gefunden.'}
+                return {"status": "error", "message": "Project not found"}
+                
         except Exception as e:
-            return {'status': 'error', 'message': f'Fehler beim Abrufen: {str(e)}'}
+            return {"status": "error", "message": f"Error getting project info: {str(e)}"}
+    
+    def set_example_questions(self, namespace: str, questions_and_answers: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Store example questions and answers for a namespace.
+        
+        Args:
+            namespace: Namespace identifier
+            questions_and_answers: List of question-answer pairs
+            
+        Returns:
+            Dict containing operation status
+        """
+        try:
+            ref = self._db.reference(f"/files/{namespace}/example_questions")
+            ref.set({
+                "questions_and_answers": questions_and_answers,
+                "timestamp": {"serverValue": "timestamp"},
+                "status": "completed"
+            })
+            
+            return {"status": "success", "message": "Example questions saved successfully"}
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Error saving example questions: {str(e)}"}
+    
+    def get_example_questions(self, namespace: str) -> Dict[str, Any]:
+        """
+        Retrieve example questions and answers for a namespace.
+        
+        Args:
+            namespace: Namespace identifier
+            
+        Returns:
+            Dict containing questions and answers or error
+        """
+        try:
+            ref = self._db.reference(f"/files/{namespace}/example_questions")
+            data = ref.get()
+            
+            if data:
+                return {
+                    "status": "success", 
+                    "data": data.get("questions_and_answers", []),
+                    "timestamp": data.get("timestamp"),
+                    "generation_status": data.get("status", "unknown")
+                }
+            else:
+                return {"status": "not_found", "message": "No example questions found"}
+                
+        except Exception as e:
+            return {"status": "error", "message": f"Error getting example questions: {str(e)}"}
+    
+    def set_example_questions_status(self, namespace: str, status: str) -> Dict[str, Any]:
+        """
+        Set the generation status of example questions for a namespace.
+        
+        Args:
+            namespace: Namespace identifier
+            status: Generation status ("generating", "completed", "error")
+            
+        Returns:
+            Dict containing operation status
+        """
+        try:
+            ref = self._db.reference(f"/files/{namespace}/example_questions/status")
+            ref.set(status)
+            
+            return {"status": "success", "message": f"Status set to {status}"}
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Error setting status: {str(e)}"}
+    
+    def get_example_questions_status(self, namespace: str) -> Dict[str, Any]:
+        """
+        Get the generation status of example questions for a namespace.
+        
+        Args:
+            namespace: Namespace identifier
+            
+        Returns:
+            Dict containing generation status
+        """
+        try:
+            ref = self._db.reference(f"/files/{namespace}/example_questions/status")
+            status = ref.get()
+            
+            return {
+                "status": "success", 
+                "generation_status": status if status else "not_found"
+            }
+            
+        except Exception as e:
+            return {"status": "error", "message": f"Error getting status: {str(e)}"}
 
 
 

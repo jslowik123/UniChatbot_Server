@@ -831,7 +831,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             if self._firebase_available:
                 project_info_result = self._firebase.get_project_info(namespace)
                 if project_info_result.get("status") == "success":
-                    project_info = project_info_result.get("info")
+                    project_info = project_info_result.get("data")
 
                 firebase_result = self._firebase.get_namespace_data(namespace)
                 if firebase_result.get("status") == "success" and firebase_result.get("data"):
@@ -879,34 +879,183 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
 
     def get_documents(self, namespace: str) -> str:
         """
-        Get a simple string representation of all documents in a namespace for assessment purposes.
+        Get formatted string of documents in a namespace.
         
         Args:
-            namespace: Namespace identifier
+            namespace: Namespace to get documents for
             
         Returns:
-            String containing document overview
+            Formatted string of documents or error message
         """
         try:
-            summary_data = self.get_namespace_summary(namespace)
+            # Get all documents from vector store
+            vectorstore = self.setup_vectorstore(namespace)
             
-            if summary_data["status"] != "success" or summary_data["document_count"] == 0:
-                return "Keine Dokumente im Namespace verfügbar."
+            # Get all document IDs from this namespace
+            index = self._vector_manager.pc.Index(self._index_name)
             
-            documents_info = []
-            for doc in summary_data["documents"]:
-                doc_text = f"- Dokument: {doc.get('name', doc['id'])}\n"
-                doc_text += f"  ID: {doc['id']}\n"
-                doc_text += f"  Status: {doc.get('status', 'Unknown')}\n"
-                doc_text += f"  Chunks: {doc.get('chunk_count', 0)}\n"
-                doc_text += f"  Zusammenfassung: {doc['summary']}\n"
-                if doc.get('additional_info'):
-                    doc_text += f"  Zusätzliche Info: {doc['additional_info']}\n"
-                documents_info.append(doc_text)
+            # Query for all vectors in the namespace
+            query_response = index.query(
+                vector=[0.0] * self._vector_manager.embedding_dim,
+                top_k=10000,
+                include_metadata=True,
+                namespace=namespace
+            )
             
-            return f"Dokumente im Namespace '{namespace}' ({summary_data['document_count']} Dokumente):\n\n" + "\n".join(documents_info)
+            # Group by document ID
+            documents = {}
+            for match in query_response['matches']:
+                doc_id = match['metadata'].get('doc_id', 'unknown')
+                if doc_id not in documents:
+                    documents[doc_id] = {
+                        'filename': match['metadata'].get('filename', 'unknown'),
+                        'chunks': []
+                    }
+                documents[doc_id]['chunks'].append({
+                    'content': match['metadata'].get('content', ''),
+                    'score': match['score']
+                })
+            
+            # Format output
+            formatted_docs = []
+            for doc_id, info in documents.items():
+                formatted_docs.append(f"Document: {info['filename']} (ID: {doc_id})")
+                
+            return "\n".join(formatted_docs) if formatted_docs else "No documents found in namespace"
             
         except Exception as e:
-            return f"Fehler beim Abrufen der Dokumente: {str(e)}" 
+            return f"Error getting documents: {str(e)}"
+
+    def generate_example_questions(self, namespace: str, num_questions: int = 3) -> List[str]:
+        """
+        Generate example questions based on documents in a namespace.
+        
+        Args:
+            namespace: Namespace to generate questions for
+            num_questions: Number of questions to generate
+            
+        Returns:
+            List of example questions
+        """
+        try:
+            # Get document overview for the namespace
+            doc_overview = self._get_documents_overview_for_prompt(namespace)
+            
+            if not doc_overview or doc_overview == "KEINE DOKUMENTE VERFÜGBAR - Du hast aktuell keinen Zugang zu Dokumenten in diesem Namespace.":
+                return ["Was ist in diesem Namespace verfügbar?"]
+            
+            # Create a prompt to generate example questions
+            prompt = f"""
+            Basierend auf den folgenden Dokumenten, generiere {num_questions} relevante Beispielfragen, die Nutzer über diese Inhalte stellen könnten.
+            
+            Dokumente:
+            {doc_overview[:3000]}  # Limit to avoid token limits
+            
+            Generiere {num_questions} konkrete, spezifische Fragen, die sich auf die Inhalte der Dokumente beziehen.
+            Formatiere die Antwort als JSON-Array mit den Fragen:
+            ["Frage 1", "Frage 2", "Frage 3"]
+            
+            Beispiel für gute Fragen:
+            - "Was sind die wichtigsten Konzepte in [Thema]?"
+            - "Wie funktioniert [spezifisches Verfahren]?"
+            - "Welche Voraussetzungen gibt es für [Thema]?"
+            """
+            
+            # Use OpenAI to generate questions
+            response = self._llm.invoke(prompt)
+            
+            # Try to parse JSON response
+            try:
+                import json
+                questions = json.loads(response.content)
+                if isinstance(questions, list):
+                    return questions[:num_questions]
+                else:
+                    # Fallback if not proper JSON
+                    return [
+                        "Was sind die wichtigsten Themen in den Dokumenten?",
+                        "Welche Konzepte werden in den Dokumenten behandelt?",
+                        "Wie kann ich die Informationen in den Dokumenten nutzen?"
+                    ][:num_questions]
+                    
+            except json.JSONDecodeError:
+                # Fallback if JSON parsing fails
+                return [
+                    "Was sind die wichtigsten Themen in den Dokumenten?",
+                    "Welche Konzepte werden in den Dokumenten behandelt?",
+                    "Wie kann ich die Informationen in den Dokumenten nutzen?"
+                ][:num_questions]
+                
+        except Exception as e:
+            print(f"Error generating example questions: {str(e)}")
+            return [
+                "Was sind die wichtigsten Themen in den Dokumenten?",
+                "Welche Konzepte werden in den Dokumenten behandelt?",
+                "Wie kann ich die Informationen in den Dokumenten nutzen?"
+            ][:num_questions]
+
+    def generate_and_store_example_questions(self, namespace: str) -> Dict[str, Any]:
+        """
+        Generate example questions with answers and store them in Firebase.
+        
+        Args:
+            namespace: Namespace to generate questions for
+            
+        Returns:
+            Dict containing operation status
+        """
+        try:
+            # Set status to generating
+            if self._firebase_available:
+                self._firebase.set_example_questions_status(namespace, "generating")
+            
+            # Generate 3 questions (fixed number)
+            questions = self.generate_example_questions(namespace, 3)
+            
+            # Generate answers for each question
+            questions_and_answers = []
+            for question in questions:
+                try:
+                    response = self.answer_question(question, namespace)
+                    questions_and_answers.append({
+                        "question": question,
+                        "answer": response.get("answer", "Keine Antwort verfügbar")
+                    })
+                except Exception as e:
+                    questions_and_answers.append({
+                        "question": question,
+                        "answer": f"Fehler beim Beantworten der Frage: {str(e)}"
+                    })
+            
+            # Store in Firebase
+            if self._firebase_available:
+                result = self._firebase.set_example_questions(namespace, questions_and_answers)
+                if result["status"] == "success":
+                    return {
+                        "status": "success",
+                        "message": "Example questions generated and stored successfully",
+                        "questions_count": len(questions_and_answers)
+                    }
+                else:
+                    # Set status to error
+                    self._firebase.set_example_questions_status(namespace, "error")
+                    return {
+                        "status": "error",
+                        "message": f"Error storing questions: {result['message']}"
+                    }
+            else:
+                return {
+                    "status": "error",
+                    "message": "Firebase not available"
+                }
+                
+        except Exception as e:
+            # Set status to error
+            if self._firebase_available:
+                self._firebase.set_example_questions_status(namespace, "error")
+            return {
+                "status": "error",
+                "message": f"Error generating example questions: {str(e)}"
+            } 
         
     
