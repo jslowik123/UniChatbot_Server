@@ -82,7 +82,6 @@ class AgentProcessor:
             self._firebase = FirebaseConnection()
             self._firebase_available = True
         except ValueError as e:
-            print(f"Firebase nicht verfügbar: {e}")
             self._firebase_available = False
         
         # Initialize DocProcessor for PDF processing
@@ -214,7 +213,7 @@ class AgentProcessor:
             """Zeigt eine Übersicht aller verfügbaren Dokumente im aktuellen Namespace mit deren Zusammenfassungen und IDs."""
             try:
                 summary_data = self.get_namespace_summary(namespace)  # namespace from closure
-                print(f"📋 Document Overview für namespace: {namespace}")
+    
                 if summary_data["status"] != "success":
                     return f"FEHLER: {summary_data.get('message', 'Unbekannter Fehler beim Abrufen der Dokumentübersicht')}"
                 
@@ -257,7 +256,7 @@ class AgentProcessor:
                 document_ids: Optional - Komma-getrennte Liste von Dokument-IDs um die Suche zu filtern (z.B. 'doc1,doc2')
             """
             try:
-                print(f"🔍 PDF Search für Query: '{query}' in namespace: {namespace}")
+                
                 
                 # Input validation
                 if not query or not isinstance(query, str) or not query.strip():
@@ -267,14 +266,13 @@ class AgentProcessor:
                 target_doc_ids = None
                 if document_ids and document_ids.strip():
                     target_doc_ids = [doc_id.strip() for doc_id in document_ids.split(',') if doc_id.strip()]
-                    print(f"🎯 Suche beschränkt auf Dokumente: {target_doc_ids}")
+                
                 
                 # Perform search with error handling
                 docs = None
                 try:
                     docs = compression_retriever.invoke(query)
                 except Exception as search_error:
-                    print(f"❌ Fehler beim Pinecone-Abruf: {str(search_error)}")
                     return f"FEHLER BEI PINECONE-SUCHE: {str(search_error)}"
                 
                 # Validate Pinecone response structure
@@ -282,13 +280,13 @@ class AgentProcessor:
                     return "FEHLER: Pinecone-Antwort ist None - möglicherweise Verbindungsproblem."
                 
                 if not isinstance(docs, list):
-                    print(f"⚠️  Unerwarteter Pinecone-Response-Typ: {type(docs)}")
+    
                     return f"FEHLER: Unerwarteter Response-Typ von Pinecone: {type(docs)}"
                 
                 if not docs:
                     return "KEINE DOKUMENTE GEFUNDEN: Keine relevanten Dokumente gefunden."
                 
-                print(f"📄 Pinecone lieferte {len(docs)} Dokumente")
+        
                 
                 # Filter by document IDs if specified
                 if target_doc_ids:
@@ -297,14 +295,13 @@ class AgentProcessor:
                         try:
                             # Safe metadata extraction with error handling
                             if not hasattr(doc, 'metadata') or not isinstance(doc.metadata, dict):
-                                print(f"⚠️  Dokument ohne gültige Metadata: {doc}")
+                                
                                 continue
                             
                             doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', 'unknown'))
                             if doc_id in target_doc_ids:
                                 filtered_docs.append(doc)
                         except Exception as filter_error:
-                            print(f"❌ Fehler beim Filtern von Dokument: {str(filter_error)}")
                             continue
                     
                     docs = filtered_docs
@@ -315,32 +312,41 @@ class AgentProcessor:
                 # Extract content with comprehensive error handling and adjacent chunks
                 results = []
                 found_doc_ids = set()
+                used_pages = set()  # NEU: Seiten sammeln
                 chunk_counter = 1
                 
                 for i, doc in enumerate(docs):
                     try:
                         # Validate document structure
                         if not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
-                            print(f"⚠️  Dokument {i} hat ungültige Struktur: {doc}")
+                            
                             continue
                         
                         # Safe metadata extraction
                         if not isinstance(doc.metadata, dict):
-                            print(f"⚠️  Dokument {i} hat ungültige Metadata: {doc.metadata}")
+                            
                             doc_id = f"unknown_{i}"
                             chunk_id = None
                         else:
                             doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', f'unknown_{i}'))
                             chunk_id = doc.metadata.get('chunk_id')
-                        
+                            # NEU: Seiten extrahieren
+                            pages = doc.metadata.get('pages')
+                            if pages:
+                                # Seiten als int speichern
+                                for p in pages:
+                                    try:
+                                        used_pages.add(int(p))
+                                    except Exception:
+                                        pass
                         # Safe content extraction
                         content = getattr(doc, 'page_content', '')
                         if not isinstance(content, str):
-                            print(f"⚠️  Dokument {i} hat ungültigen Content-Typ: {type(content)}")
+                            
                             content = str(content)
                         
                         if not content.strip():
-                            print(f"⚠️  Dokument {i} hat leeren Content")
+                            
                             continue
                         
                         found_doc_ids.add(doc_id)
@@ -352,7 +358,6 @@ class AgentProcessor:
                             try:
                                 # Construct the full chunk ID
                                 full_chunk_id = f"{doc_id}_chunk_{chunk_id}"
-                                print(f"🔗 Suche Adjacent Chunks für: {full_chunk_id}")
                                 
                                 # Get adjacent chunks using vectorstore similarity search
                                 adjacent_chunks = self._get_adjacent_chunks_content(namespace, doc_id, chunk_id)
@@ -380,10 +385,9 @@ class AgentProcessor:
                                 enhanced_content = "\n".join(chunk_set)
                                 results.append(f"[DOC_ID: {doc_id}] {enhanced_content}")
                                 
-                                print(f"✅ Enhanced chunk {chunk_counter} mit Adjacent Chunks")
                                 
                             except Exception as adjacent_error:
-                                print(f"⚠️  Fehler bei Adjacent Chunks für {doc_id}_chunk_{chunk_id}: {adjacent_error}")
+                                
                                 # Fallback to normal content
                                 results.append(f"[DOC_ID: {doc_id}] {content}")
                         else:
@@ -393,7 +397,6 @@ class AgentProcessor:
                         chunk_counter += 1
                         
                     except Exception as extract_error:
-                        print(f"❌ Fehler beim Extrahieren von Dokument {i}: {str(extract_error)}")
                         continue
                 
                 if not results:
@@ -403,18 +406,15 @@ class AgentProcessor:
                 doc_ids_list = list(found_doc_ids)
                 result_text = "\n\n".join(results)
                 result_text += f"\n\n[SYSTEM_INFO] FOUND_DOCUMENT_IDS: {doc_ids_list}"
-                
+                # NEU: Seiten als SYSTEM_INFO ergänzen
+                result_text += f"\n[SYSTEM_INFO] FOUND_PAGES: {sorted(list(used_pages))}"
                 if target_doc_ids:
                     result_text += f"\n[SYSTEM_INFO] FILTERED_BY_DOC_IDS: {target_doc_ids}"
-                
-                print(f"✅ PDF Search erfolgreich: {len(results)} Ergebnisse, Dokument-IDs: {doc_ids_list}")
-                print(f"📊 Context-Länge: {len(result_text)} Zeichen")
                 
                 return result_text
                 
             except Exception as e:
                 error_msg = f"FEHLER BEIM DURCHSUCHEN: {str(e)}"
-                print(f"❌ PDF Search Fehler: {error_msg}")
                 import traceback
                 traceback.print_exc()
                 return error_msg
@@ -522,9 +522,6 @@ class AgentProcessor:
                     "additional_info": "Leerer oder ungültiger Namespace"
                 }
             
-            print(f"🤖 AGENT PROCESSOR - Question: {question[:100]}...")
-            print(f"🤖 AGENT PROCESSOR - Namespace: {namespace}")
-            
             researcher, _ = self.setup_agent(namespace)
             
             # Prepare chat history context with validation
@@ -532,29 +529,24 @@ class AgentProcessor:
             has_history = bool(chat_history and len(chat_history) > 0)
             
             if has_history:
-                print(f"🤖 AGENT PROCESSOR - Processing {len(chat_history)} chat history messages")
                 recent_messages = chat_history[-6:]  # Last 6 messages for context
                 context_parts = []
                 for i, msg in enumerate(recent_messages):
                     try:
                         if not isinstance(msg, dict):
-                            print(f"⚠️  Chat message {i} ist kein Dict: {type(msg)}")
                             continue
                         
                         role = msg.get('role', 'unknown')
                         content = msg.get('content', '')
                         
                         if not isinstance(role, str) or not isinstance(content, str):
-                            print(f"⚠️  Chat message {i} hat ungültigen Typ: role={type(role)}, content={type(content)}")
                             continue
                         
                         context_parts.append(f"{role.upper()}: {content}")
                     except Exception as msg_error:
-                        print(f"❌ Fehler beim Verarbeiten von Chat-Message {i}: {str(msg_error)}")
                         continue
                 
                 chat_context = "\n".join(context_parts)
-                print(f"🤖 AGENT PROCESSOR - Chat context length: {len(chat_context)} chars")
             
             # Create structured task description
             task_description = f"""
@@ -627,8 +619,6 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             
             # Try to parse the JSON response with comprehensive error handling
             try:
-                print(f"🤖 AGENT PROCESSOR - Raw result length: {len(result_str)} chars")
-                print(f"🤖 AGENT PROCESSOR - Raw result preview: {result_str[:200]}...")
                 
                 # Extract JSON from the response
                 json_start = result_str.find('{')
@@ -636,17 +626,24 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 
                 if json_start != -1 and json_end != -1:
                     json_str = result_str[json_start:json_end]
-                    print(f"🤖 AGENT PROCESSOR - Extracted JSON: {json_str[:300]}...")
                     
                     try:
                         parsed_response = json.loads(json_str)
-                        print(f"🤖 AGENT PROCESSOR - JSON parsing successful")
                         
                         # Validate parsed response structure
                         if not isinstance(parsed_response, dict):
-                            print(f"⚠️  Parsed response is not a dict: {type(parsed_response)}")
                             raise ValueError("Parsed response is not a dictionary")
                         
+                        # NEU: Seiten extrahieren
+                        pages = []
+                        # Suche nach FOUND_PAGES im result_str
+                        import re
+                        match = re.search(r'\\[SYSTEM_INFO\\] FOUND_PAGES: (\\[.*?\\])', result_str)
+                        if match:
+                            try:
+                                pages = json.loads(match.group(1))
+                            except Exception:
+                                pages = []
                         # Validate and structure the response with safe extraction
                         structured_response = {
                             "answer": str(parsed_response.get("answer", result_str)),
@@ -654,19 +651,16 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                             "sources": parsed_response.get("sources", []) if isinstance(parsed_response.get("sources"), list) else [],
                             "confidence_score": float(parsed_response.get("confidence_score", 0.8)) if isinstance(parsed_response.get("confidence_score"), (int, float)) else 0.8,
                             "context_used": bool(parsed_response.get("context_used", has_history)),
-                            "additional_info": parsed_response.get("additional_info")
+                            "additional_info": parsed_response.get("additional_info"),
+                            "pages": pages  # NEU: Seiten in die Antwort
                         }
                         
-                        print(f"🤖 AGENT PROCESSOR - Structured response created successfully")
                         return structured_response
                         
                     except json.JSONDecodeError as json_error:
-                        print(f"❌ JSON parsing error: {str(json_error)}")
-                        print(f"❌ Problematic JSON: {json_str}")
                         raise json_error
                         
                 else:
-                    print(f"⚠️  No JSON found in response")
                     # Fallback if JSON parsing fails
                     return {
                         "answer": result_str,
@@ -678,7 +672,6 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                     }
                     
             except json.JSONDecodeError as json_error:
-                print(f"❌ JSON parsing completely failed: {str(json_error)}")
                 # Fallback if JSON parsing fails
                 return {
                     "answer": result_str,
@@ -689,7 +682,6 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                     "additional_info": f"JSON-Parsing fehlgeschlagen: {str(json_error)}"
                 }
             except Exception as parse_error:
-                print(f"❌ Unexpected parsing error: {str(parse_error)}")
                 return {
                     "answer": result_str,
                     "document_ids": [],
@@ -700,7 +692,6 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 }
             
         except Exception as e:
-            print(f"❌ AGENT PROCESSOR - Unerwarteter Fehler: {str(e)}")
             import traceback
             traceback.print_exc()
             return {
@@ -879,7 +870,7 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
 
     def get_documents(self, namespace: str) -> str:
         """
-        Get formatted string of documents in a namespace.
+        Get formatted string of documents in a namespace (from Firebase).
         
         Args:
             namespace: Namespace to get documents for
@@ -888,41 +879,28 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
             Formatted string of documents or error message
         """
         try:
-            # Get all documents from vector store
-            vectorstore = self.setup_vectorstore(namespace)
+            if not self._firebase_available:
+                return "Firebase not available."
             
-            # Get all document IDs from this namespace
-            index = self._vector_manager.pc.Index(self._index_name)
+            firebase_result = self._firebase.get_namespace_data(namespace)
+            if firebase_result.get("status") != "success" or not firebase_result.get("data"):
+                return f"No documents found in namespace {namespace}"
             
-            # Query for all vectors in the namespace
-            query_response = index.query(
-                vector=[0.0] * self._vector_manager.embedding_dim,
-                top_k=10000,
-                include_metadata=True,
-                namespace=namespace
-            )
-            
-            # Group by document ID
-            documents = {}
-            for match in query_response['matches']:
-                doc_id = match['metadata'].get('doc_id', 'unknown')
-                if doc_id not in documents:
-                    documents[doc_id] = {
-                        'filename': match['metadata'].get('filename', 'unknown'),
-                        'chunks': []
-                    }
-                documents[doc_id]['chunks'].append({
-                    'content': match['metadata'].get('content', ''),
-                    'score': match['score']
-                })
-            
-            # Format output
+            namespace_data = firebase_result["data"]
             formatted_docs = []
-            for doc_id, info in documents.items():
-                formatted_docs.append(f"Document: {info['filename']} (ID: {doc_id})")
-                
-            return "\n".join(formatted_docs) if formatted_docs else "No documents found in namespace"
+            for doc_id, doc_data in namespace_data.items():
+                # Skip non-document entries (e.g. example_questions, info, summary)
+                if not isinstance(doc_data, dict) or ("keywords" not in doc_data and "summary" not in doc_data):
+                    continue
+                filename = doc_data.get("name", doc_id)
+                summary = doc_data.get("summary", "Keine Zusammenfassung verfügbar")
+                additional_info = doc_data.get("additional_info", None)
+                doc_str = f"Document: {filename} (ID: {doc_id})\n  Summary: {summary}"
+                if additional_info:
+                    doc_str += f"\n  Beschreibung: {additional_info}"
+                formatted_docs.append(doc_str)
             
+            return "\n\n".join(formatted_docs) if formatted_docs else f"No documents found in namespace {namespace}"
         except Exception as e:
             return f"Error getting documents: {str(e)}"
 
@@ -987,7 +965,6 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 ][:num_questions]
                 
         except Exception as e:
-            print(f"Error generating example questions: {str(e)}")
             return [
                 "Was sind die wichtigsten Themen in den Dokumenten?",
                 "Welche Konzepte werden in den Dokumenten behandelt?",

@@ -134,35 +134,35 @@ class VectorManager:
             batch_metadatas = metadatas[start_idx:end_idx]
             batch_ids = ids[start_idx:end_idx]
             
-            print(f"📦 Uploading batch {batch_idx + 1}/{num_batches}: items {start_idx}-{end_idx-1} ({len(batch_texts)} items)")
+            # print(f"📦 Uploading batch {batch_idx + 1}/{num_batches}: items {start_idx}-{end_idx-1} ({len(batch_texts)} items)")
             
             # Calculate approximate batch size for logging
             batch_size_estimate = sum(len(text) for text in batch_texts) + sum(len(str(meta)) for meta in batch_metadatas)
-            print(f"📊 Estimated batch size: ~{batch_size_estimate/1024:.1f} KB (~{batch_size_estimate/1024/1024:.3f} MB)")
+            # print(f"📊 Estimated batch size: ~{batch_size_estimate/1024:.1f} KB (~{batch_size_estimate/1024/1024:.3f} MB)")
             
             # Validate batch size isn't too large
-            if batch_size_estimate > 1.5 * 1024 * 1024:  # 1.5MB warning
-                print(f"⚠️  WARNING: Batch size {batch_size_estimate/1024/1024:.2f} MB is close to 2MB limit!")
+            # if batch_size_estimate > 1.5 * 1024 * 1024:  # 1.5MB warning
+                # print(f"⚠️  WARNING: Batch size {batch_size_estimate/1024/1024:.2f} MB is close to 2MB limit!")
             
             max_retries = 3
             batch_success = False
             
             for attempt in range(max_retries):
                 try:
-                    print(f"🔄 Attempting upload batch {batch_idx + 1}/{num_batches}, attempt {attempt + 1}/{max_retries}")
+                    # print(f"🔄 Attempting upload batch {batch_idx + 1}/{num_batches}, attempt {attempt + 1}/{max_retries}")
                     vectorstore.add_texts(texts=batch_texts, metadatas=batch_metadatas, ids=batch_ids)
-                    print(f"✅ Successfully uploaded batch {batch_idx + 1}/{num_batches} on attempt {attempt + 1}")
+                    # print(f"✅ Successfully uploaded batch {batch_idx + 1}/{num_batches} on attempt {attempt + 1}")
                     batch_success = True
                     successful_batches += 1
                     break
                 except Exception as upload_error:
                     error_msg = str(upload_error)
-                    print(f"❌ Batch {batch_idx + 1} attempt {attempt + 1} failed: {error_msg}")
+                    # print(f"❌ Batch {batch_idx + 1} attempt {attempt + 1} failed: {error_msg}")
                     
                     # Check if it's a size-related error
-                    if "exceeds the maximum supported size" in error_msg:
-                        print(f"🚨 SIZE LIMIT ERROR: Batch {batch_idx + 1} is too large even with batch_size={self._batch_size}")
-                        print(f"🔧 Consider reducing batch_size further or optimizing text content")
+                    # if "exceeds the maximum supported size" in error_msg:
+                        # print(f"🚨 SIZE LIMIT ERROR: Batch {batch_idx + 1} is too large even with batch_size={self._batch_size}")
+                        # print(f"🔧 Consider reducing batch_size further or optimizing text content")
                     
                     if attempt == max_retries - 1:
                         print(f"💥 FAILED: Batch {batch_idx + 1} failed after {max_retries} attempts")
@@ -171,15 +171,15 @@ class VectorManager:
                     # Wait before retry (exponential backoff)
                     import time
                     wait_time = 2 ** attempt
-                    print(f"⏳ Waiting {wait_time} seconds before retry...")
+                    # print(f"⏳ Waiting {wait_time} seconds before retry...")
                     time.sleep(wait_time)
             
             if not batch_success:
                 raise Exception(f"Failed to upload batch {batch_idx + 1}")
         
-        print(f"🎉 SUCCESS: All {successful_batches}/{num_batches} batches uploaded successfully!")
-        print(f"📈 Total items processed: {total_items}")
-        print(f"📊 Final batch configuration: batch_size={self._batch_size}, total_batches={num_batches}")
+        # print(f"🎉 SUCCESS: All {successful_batches}/{num_batches} batches uploaded successfully!")
+        # print(f"📈 Total items processed: {total_items}")
+        # print(f"📊 Final batch configuration: batch_size={self._batch_size}, total_batches={num_batches}")
 
     def index_document(self, processed_pdf: Dict[str, Any], namespace: str, fileID: str) -> Dict[str, Any]:
         """
@@ -249,20 +249,29 @@ class VectorManager:
                 print(f"📸 Processing {len(special_pages_data)} special pages for enhanced indexing")
                 
                 for page_data in special_pages_data:
-                    page_num = page_data["page_number"]
-                    enhanced_text = page_data["enhanced_text"]
-                    
-                    if enhanced_text and enhanced_text.strip():
-                        special_pages_texts.append(enhanced_text)
-                        special_pages_metadatas.append({
-                            "document_id": fileID,
-                            "chunk_id": f"special_page_{page_num}",
-                            "original_filename": processed_pdf.get("original_file", "unknown"),
-                            "chunk_type": "special_page",
-                            "page_number": page_num,
-                            "enhanced_content": True
-                        })
-                        special_pages_ids.append(f"{fileID}_special_page_{page_num}")
+                    page_num = page_data.get("page_number", "unknown")
+                    enhanced_text = page_data.get("enhanced_text", None)
+                    if not enhanced_text or not enhanced_text.strip():
+                        # Fallback: versuche normalen Text aus page_data['text'] zu nehmen
+                        fallback_text = page_data.get("text", None)
+                        if fallback_text and fallback_text.strip():
+                            print(f"⚠️ Kein 'enhanced_text' für Seite {page_num}, nutze Fallback 'text' ({len(fallback_text)} Zeichen). Keys: {list(page_data.keys())}")
+                            enhanced_text = fallback_text
+                        else:
+                            print(f"⚠️ Kein 'enhanced_text' und kein Fallback-Text für Seite {page_num}. Keys: {list(page_data.keys())}")
+                            continue  # Seite überspringen
+                    else:
+                        print(f"✅ enhanced_text für Seite {page_num}: {len(enhanced_text)} Zeichen")
+                    special_pages_texts.append(enhanced_text)
+                    special_pages_metadatas.append({
+                        "document_id": fileID,
+                        "chunk_id": f"special_page_{page_num}",
+                        "original_filename": processed_pdf.get("original_file", "unknown"),
+                        "chunk_type": "special_page",
+                        "page_number": str(page_num),
+                        "enhanced_content": True
+                    })
+                    special_pages_ids.append(f"{fileID}_special_page_{page_num}")
             
             # Combine all data
             all_texts = texts + special_pages_texts

@@ -50,7 +50,6 @@ class DocProcessor:
             self._firebase = FirebaseConnection()
             self._firebase_available = True
         except ValueError as e:
-            print(f"Firebase nicht verfügbar: {e}")
             self._firebase_available = False
 
     def _extract_page_text(self, page, page_num: int) -> Dict[str, Any]:
@@ -105,7 +104,7 @@ class DocProcessor:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": "Bitte extrahiere den gesamten Text aus diesem Bild vollständig und genau. Achte auf alle Details, Tabellen, Formeln, Fußnoten und jeden sichtbaren Text. Gib nur den reinen Text zurück, ohne zusätzliche Kommentare oder Formatierungen."
+                                    "text": "Bitte extrahiere den gesamten Text aus diesem Bild vollständig und genau. Achte auf alle Details, Tabellen, Formeln, Fußnoten und jeden sichtbaren Text. Gib nur den reinen Text zurück, ohne zusätzliche Kommentare oder Formatierungen. Einzelne Sachen kannst du auch richtig formattieren, sodass infroamtioenn korrekt extrahiert werden."
                                 },
                                 {
                                     "type": "image_url",
@@ -120,27 +119,22 @@ class DocProcessor:
                     max_tokens=4000,
                     temperature=0.0  # Deterministic output for consistency
                 )
-                
                 openai_extracted_text = vision_response.choices[0].message.content
+                print(f"🤖 OpenAI Vision raw response for page {page_num + 1}: {repr(openai_extracted_text)[:300]}")
                 print(f"🤖 OpenAI Vision extracted {len(openai_extracted_text)} chars from page {page_num + 1}")
-                
-            except Exception as vision_error:
-                print(f"⚠️ OpenAI Vision API error for page {page_num + 1}: {vision_error}")
-                # Fallback to PyMuPDF text extraction
-                openai_extracted_text = page.get_text()
-                print(f"📄 Fallback to PyMuPDF: {len(openai_extracted_text)} chars from page {page_num + 1}")
-            
-            print(f"📸 Page {page_num + 1} special processing: {len(img_base64)} base64 chars, {len(openai_extracted_text)} text chars")
-            
-            return {
-                "page_number": page_num + 1,  # 1-indexed for user-friendly display
-                "image_base64": img_base64,
-                "text": openai_extracted_text,
-                "image_format": "png",
-                "image_size": len(img_bytes),
-                "text_length": len(openai_extracted_text),
-                "extracted_with_openai": True
-            }
+                if not openai_extracted_text or not openai_extracted_text.strip():
+                    print(f"⚠️ OpenAI Vision returned empty text for page {page_num + 1}, using PyMuPDF fallback.")
+                    openai_extracted_text = page.get_text()
+                    print(f"📄 PyMuPDF fallback extracted {len(openai_extracted_text)} chars from page {page_num + 1}")
+                return {
+                    "page_number": page_num + 1,
+                    "enhanced_text": openai_extracted_text,
+                    "image_base64": img_base64,
+                    "meta": {"page_number": str(page_num + 1)}
+                }
+            except Exception as e:
+                print(f"Fehler bei OpenAI Vision: {e}")
+                return None
             
         except Exception as e:
             print(f"Error extracting page {page_num + 1} as image: {e}")

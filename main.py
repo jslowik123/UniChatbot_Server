@@ -149,7 +149,6 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
             "special_pages": special_pages
         }
     except Exception as e:
-        print(f"Upload error: {str(e)}")
         return {
             "status": "error", 
             "message": f"Error processing file: {str(e)}", 
@@ -384,7 +383,7 @@ async def get_example_questions(namespace: str):
             "status": "error",
             "message": f"Error getting example questions: {str(e)}"
         }
-
+        
 
 @app.post("/create_namespace")
 async def create_namespace(namespace: str = Form(...),dimension: int = Form(DEFAULT_DIMENSION)):
