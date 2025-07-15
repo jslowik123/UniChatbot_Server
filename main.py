@@ -1,5 +1,8 @@
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
+# Reduce HTTP request logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -111,7 +114,7 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
         Dict containing upload status and task information
     """
     try:
-        print(f"Upload request received: filename={file.filename}, namespace={namespace}, fileID={fileID}, numberPages={numberPages}, {type(numberPages)}")
+        print(f"Upload started: {file.filename} in namespace {namespace}")
         
         if not file.filename.lower().endswith('.pdf'):
             return {
@@ -121,14 +124,12 @@ async def upload_file(file: UploadFile = File(...), namespace: str = Form(...), 
             }
             
         content = await file.read()
-        print(f"File content read: {len(content)} bytes")
         
         # Parse numberPages from string to list of integers if provided
         special_pages = []
         if numberPages:
             try:
                 special_pages = [int(page.strip()) for page in numberPages.split(',') if page.strip()]
-                print(f"Special pages to process: {special_pages}")
             except ValueError:
                 return {
                     "status": "error",
@@ -250,7 +251,8 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
                 "sources": [],
                 "confidence_score": 0.0,
                 "context_used": False,
-                "additional_info": "Leere oder ungültige Benutzereingabe"
+                "additional_info": "Leere oder ungültige Benutzereingabe",
+                "pages": []
             }
         }
     
@@ -264,7 +266,8 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
                 "sources": [],
                 "confidence_score": 0.0,
                 "context_used": False,
-                "additional_info": "Leerer oder ungültiger Namespace"
+                "additional_info": "Leerer oder ungültiger Namespace",
+                "pages": []
             }
         }
     
@@ -302,7 +305,8 @@ async def send_message(user_input: str = Form(...), namespace: str = Form(...)):
                 "sources": [],
                 "confidence_score": 0.0,
                 "context_used": False,
-                "additional_info": f"Exception: {type(e).__name__}"
+                "additional_info": f"Exception: {type(e).__name__}",
+                "pages": []
             }
         }
 

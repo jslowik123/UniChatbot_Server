@@ -121,8 +121,7 @@ class VectorManager:
         
         # Calculate total estimated size
         total_size_estimate = sum(len(text) for text in texts) + sum(len(str(meta)) for meta in metadatas)
-        print(f"📤 Starting batch upload: {total_items} items in {num_batches} batches (batch_size: {self._batch_size})")
-        print(f"📊 Total estimated size: ~{total_size_estimate/1024/1024:.2f} MB")
+        print(f"Uploading {total_items} items in {num_batches} batches")
         
         successful_batches = 0
         
@@ -165,21 +164,18 @@ class VectorManager:
                         # print(f"🔧 Consider reducing batch_size further or optimizing text content")
                     
                     if attempt == max_retries - 1:
-                        print(f"💥 FAILED: Batch {batch_idx + 1} failed after {max_retries} attempts")
+                        print(f"Upload failed: Batch {batch_idx + 1} after {max_retries} attempts")
                         raise Exception(f"Failed to upload batch {batch_idx + 1} after {max_retries} attempts: {error_msg}")
                     
                     # Wait before retry (exponential backoff)
                     import time
                     wait_time = 2 ** attempt
-                    # print(f"⏳ Waiting {wait_time} seconds before retry...")
                     time.sleep(wait_time)
             
             if not batch_success:
                 raise Exception(f"Failed to upload batch {batch_idx + 1}")
         
-        # print(f"🎉 SUCCESS: All {successful_batches}/{num_batches} batches uploaded successfully!")
-        # print(f"📈 Total items processed: {total_items}")
-        # print(f"📊 Final batch configuration: batch_size={self._batch_size}, total_batches={num_batches}")
+        print(f"Upload completed: {successful_batches}/{num_batches} batches processed")
 
     def index_document(self, processed_pdf: Dict[str, Any], namespace: str, fileID: str) -> Dict[str, Any]:
         """
@@ -225,7 +221,11 @@ class VectorManager:
                         # Convert pages to strings for Pinecone compatibility
                         pages_as_strings = [str(int(page)) for page in chunk_with_page["pages"]]
                         chunk_metadata["pages"] = pages_as_strings
-                        chunk_metadata["page_range"] = f"{min(chunk_with_page['pages'])}-{max(chunk_with_page['pages'])}"
+                        # Add page range for consistency
+                        if len(chunk_with_page['pages']) > 1:
+                            chunk_metadata["page_range"] = f"{min(chunk_with_page['pages'])}-{max(chunk_with_page['pages'])}"
+                        else:
+                            chunk_metadata["page_range"] = str(chunk_with_page['pages'][0])
                 
                 metadatas.append(chunk_metadata)
             
@@ -246,7 +246,6 @@ class VectorManager:
             # Process special pages if available
             if "special_pages_data" in processed_pdf:
                 special_pages_data = processed_pdf["special_pages_data"]
-                print(f"📸 Processing {len(special_pages_data)} special pages for enhanced indexing")
                 
                 for page_data in special_pages_data:
                     page_num = page_data.get("page_number", "unknown")
@@ -255,13 +254,9 @@ class VectorManager:
                         # Fallback: versuche normalen Text aus page_data['text'] zu nehmen
                         fallback_text = page_data.get("text", None)
                         if fallback_text and fallback_text.strip():
-                            print(f"⚠️ Kein 'enhanced_text' für Seite {page_num}, nutze Fallback 'text' ({len(fallback_text)} Zeichen). Keys: {list(page_data.keys())}")
                             enhanced_text = fallback_text
                         else:
-                            print(f"⚠️ Kein 'enhanced_text' und kein Fallback-Text für Seite {page_num}. Keys: {list(page_data.keys())}")
                             continue  # Seite überspringen
-                    else:
-                        print(f"✅ enhanced_text für Seite {page_num}: {len(enhanced_text)} Zeichen")
                     special_pages_texts.append(enhanced_text)
                     special_pages_metadatas.append({
                         "document_id": fileID,
@@ -269,6 +264,8 @@ class VectorManager:
                         "original_filename": processed_pdf.get("original_file", "unknown"),
                         "chunk_type": "special_page",
                         "page_number": str(page_num),
+                        "pages": [str(page_num)],  # Add pages array for consistency
+                        "page_range": str(page_num),  # Add page range for consistency
                         "enhanced_content": True
                     })
                     special_pages_ids.append(f"{fileID}_special_page_{page_num}")
@@ -278,17 +275,13 @@ class VectorManager:
             all_metadatas = metadatas + special_pages_metadatas
             all_ids = [f"{fileID}_chunk_{i}" for i in range(len(processed_pdf["chunks"]))] + [f"{fileID}_summary"] + special_pages_ids
             
-            print(f"📤 Indexing {len(all_texts)} texts for document {fileID} (including {len(special_pages_texts)} additional enhanced pages)")
-            print(f"📊 Text lengths: {[len(text) for text in all_texts[:5]]}...")  # Show first 5 lengths
-            if chunks_with_pages:
-                print(f"📄 Normal chunks with page tracking: {len([c for c in chunks_with_pages if 'pages' in c])}")
-            print(f"📸 Additional enhanced page vectors: {len(special_pages_texts)}")
+            print(f"Indexing document {fileID}: {len(all_texts)} text vectors")
             
             # Use batch upload to prevent exceeding Pinecone's 2MB limit
             self._batch_upload_texts(vectorstore, all_texts, all_metadatas, all_ids)
             
             if special_pages_texts:
-                print(f"📸 Successfully indexed {len(special_pages_texts)} ADDITIONAL special page vectors (pages exist twice now: normal + enhanced)")
+                print(f"Special pages processed: {len(special_pages_texts)} additional vectors")
             
             return {
                 "status": "success",
@@ -346,7 +339,7 @@ class VectorManager:
                 if chunk_id in current_response.get('vectors', {}):
                     result["current"] = chunk_id
             except Exception as e:
-                print(f"❌ Error fetching current chunk {chunk_id}: {e}")
+                pass
             
             # Get previous chunk
             if prev_id:
@@ -355,7 +348,7 @@ class VectorManager:
                     if prev_id in prev_response.get('vectors', {}):
                         result["previous"] = prev_id
                 except Exception as e:
-                    print(f"⚠️  Previous chunk {prev_id} not found: {e}")
+                    pass
             
             # Get next chunk
             try:
@@ -363,12 +356,12 @@ class VectorManager:
                 if next_id in next_response.get('vectors', {}):
                     result["next"] = next_id
             except Exception as e:
-                print(f"⚠️  Next chunk {next_id} not found: {e}")
+                pass
             
             return result
             
         except Exception as e:
-            print(f"❌ Error in get_adjacent_chunks: {e}")
+            pass
             return {"current": None, "previous": None, "next": None}
 
     def get_chunk_content_by_id(self, namespace: str, chunk_id: str) -> Optional[str]:
@@ -399,7 +392,7 @@ class VectorManager:
             return None
             
         except Exception as e:
-            print(f"❌ Error getting chunk content for {chunk_id}: {e}")
+            pass
             return None
 
     def get_adjacent_chunks_content(self, namespace: str, doc_id: str, chunk_id: int) -> Dict[str, Optional[str]]:
@@ -428,9 +421,8 @@ class VectorManager:
                     )
                     if prev_docs and len(prev_docs) > 0:
                         result["previous"] = prev_docs[0].page_content
-                        print(f"📄 Found previous chunk {doc_id}_chunk_{chunk_id - 1}")
                 except Exception as e:
-                    print(f"⚠️  Could not get previous chunk: {e}")
+                    pass
             
             # Get current chunk
             try:
@@ -441,9 +433,8 @@ class VectorManager:
                 )
                 if current_docs and len(current_docs) > 0:
                     result["current"] = current_docs[0].page_content
-                    print(f"📄 Found current chunk {doc_id}_chunk_{chunk_id}")
             except Exception as e:
-                print(f"⚠️  Could not get current chunk: {e}")
+                pass
             
             # Get next chunk
             try:
@@ -454,14 +445,13 @@ class VectorManager:
                 )
                 if next_docs and len(next_docs) > 0:
                     result["next"] = next_docs[0].page_content
-                    print(f"📄 Found next chunk {doc_id}_chunk_{chunk_id + 1}")
             except Exception as e:
-                print(f"⚠️  Could not get next chunk: {e}")
+                pass
             
             return result
             
         except Exception as e:
-            print(f"❌ Error in get_adjacent_chunks_content: {e}")
+            pass
             return {"previous": None, "current": None, "next": None}
 
     def delete_document(self, namespace: str, fileID: str) -> Dict[str, Any]:

@@ -164,6 +164,7 @@ def message_bot_agent(user_input: str, namespace: str = "default",
             "sources": [],
             "confidence_score": 0.0,
             "context_used": False,
-            "additional_info": f"Exception: {type(e).__name__}"
+            "additional_info": f"Exception: {type(e).__name__}",
+            "pages": []
         }
 

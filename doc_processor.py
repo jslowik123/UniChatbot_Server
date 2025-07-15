@@ -104,7 +104,7 @@ class DocProcessor:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": "Bitte extrahiere den gesamten Text aus diesem Bild vollständig und genau. Achte auf alle Details, Tabellen, Formeln, Fußnoten und jeden sichtbaren Text. Gib nur den reinen Text zurück, ohne zusätzliche Kommentare oder Formatierungen. Einzelne Sachen kannst du auch richtig formattieren, sodass infroamtioenn korrekt extrahiert werden."
+                                    "text": "Bitte extrahiere den gesamten Text aus diesem Bild vollständig und genau. Achte auf alle Details, Tabellen, Formeln, Fußnoten und jeden sichtbaren Text. Gib nur den reinen Text zurück, ohne zusätzliche Kommentare oder Formatierungen. Einzelne Sachen kannst du auch richtig formattieren, sodass infroamtioenn korrekt extrahiert werden. Wenn du keinen Text findest, gib einfach 'Kein Text gefunden' zurück."
                                 },
                                 {
                                     "type": "image_url",

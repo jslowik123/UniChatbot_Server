@@ -6,11 +6,7 @@ import json
 import os
 import re
 from dotenv import load_dotenv
-# Debug print
-print("Environment variables:")
-print(f"FIREBASE_DATABASE_URL: {os.getenv('FIREBASE_DATABASE_URL')}")
-print(f"FIREBASE_CREDENTIALS_PATH: {os.getenv('FIREBASE_CREDENTIALS_PATH')}")
-print(f"Current working directory: {os.getcwd()}")
+
 
 class FirebaseConnection:
     """
@@ -45,15 +41,12 @@ class FirebaseConnection:
             else:
                 # Get the default app
                 app = firebase_admin.get_app()
-                print(f"Using existing Firebase app: {app.name}")
         except ValueError as e:
             # If no default app exists, try to get or create one
             try:
                 app = firebase_admin.get_app()
-                print(f"Retrieved existing Firebase app: {app.name}")
             except ValueError:
                 # No app exists, initialize new one
-                print("No Firebase app found, initializing new one...")
                 self._initialize_firebase_app(database_url)
         
         self._db = db
@@ -76,45 +69,41 @@ class FirebaseConnection:
                 firebase_admin.initialize_app(cred, {
                     'databaseURL': database_url
                 })
-                print("Firebase initialized with JSON credentials")
+            
             elif credentials_path and os.path.exists(credentials_path):
                 # Initialize from file
                 cred = credentials.Certificate(credentials_path)
                 firebase_admin.initialize_app(cred, {
                     'databaseURL': database_url
                 })
-                print("Firebase initialized with file credentials")
+    
             else:
                 # Emergency fallback without credentials (for development)
                 firebase_admin.initialize_app(options={
                     'databaseURL': database_url
                 })
-                print("Firebase initialized without credentials (development mode)")
+
         except json.JSONDecodeError as e:
-            print(f"Error decoding JSON credentials: {str(e)}")
+
             # Try file credentials as fallback
             if credentials_path and os.path.exists(credentials_path):
                 cred = credentials.Certificate(credentials_path)
                 firebase_admin.initialize_app(cred, {
                     'databaseURL': database_url
                 })
-                print("Firebase initialized with file credentials after JSON error")
             else:
                 # Last resort fallback
                 firebase_admin.initialize_app(options={
                     'databaseURL': database_url
                 })
-                print("Firebase initialized without credentials after JSON error")
+        
         except Exception as e:
-            print(f"Firebase initialization error: {str(e)}")
             # Last resort - try basic initialization
             try:
                 firebase_admin.initialize_app(options={
                     'databaseURL': database_url
                 })
-                print("Firebase initialized with basic fallback")
             except Exception as final_e:
-                print(f"Final Firebase initialization failed: {str(final_e)}")
                 raise ValueError(f"Could not initialize Firebase: {str(final_e)}")
 
     def _fallback_initialization(self, database_url: str, credentials_path: str = None):

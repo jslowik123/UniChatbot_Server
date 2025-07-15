@@ -34,6 +34,7 @@ class StructuredResponse(BaseModel):
     confidence_score: float = Field(description="Vertrauensscore der Antwort (0.0-1.0)")
     context_used: bool = Field(description="Ob Chat-History-Kontext verwendet wurde")
     additional_info: Optional[str] = Field(description="Zusätzliche Informationen oder Hinweise", default=None)
+    pages: List[int] = Field(description="Liste der Seitenzahlen der Textabschnitte, die für die Antwort verwendet wurden", default=[])
 
 
 class AgentProcessor:
@@ -314,6 +315,7 @@ class AgentProcessor:
                 found_doc_ids = set()
                 used_pages = set()  # NEU: Seiten sammeln
                 chunk_counter = 1
+                doc_index_map = {}  # Track document indices for DOK format
                 
                 for i, doc in enumerate(docs):
                     try:
@@ -327,18 +329,28 @@ class AgentProcessor:
                             
                             doc_id = f"unknown_{i}"
                             chunk_id = None
+                            pages = None
                         else:
                             doc_id = doc.metadata.get('document_id', doc.metadata.get('pdf_id', f'unknown_{i}'))
                             chunk_id = doc.metadata.get('chunk_id')
                             # NEU: Seiten extrahieren
                             pages = doc.metadata.get('pages')
+                            page_number = doc.metadata.get('page_number')
+                            
+                            # Handle pages list (regular chunks)
                             if pages:
-                                # Seiten als int speichern
                                 for p in pages:
                                     try:
                                         used_pages.add(int(p))
-                                    except Exception:
+                                    except Exception as e:
                                         pass
+                            
+                            # Handle single page_number (special pages)
+                            if page_number:
+                                try:
+                                    used_pages.add(int(page_number))
+                                except Exception as e:
+                                    pass
                         # Safe content extraction
                         content = getattr(doc, 'page_content', '')
                         if not isinstance(content, str):
@@ -351,7 +363,24 @@ class AgentProcessor:
                         
                         found_doc_ids.add(doc_id)
                         
-                        # Page information no longer tracked
+                        # Track document index for DOK format
+                        if doc_id not in doc_index_map:
+                            doc_index_map[doc_id] = len(doc_index_map)
+                        doc_index = doc_index_map[doc_id]
+                        
+                        # Get current page for chunk header
+                        current_page = None
+                        if pages and len(pages) > 0:
+                            current_page = pages[0]  # Use first page
+                        elif page_number:
+                            current_page = page_number
+                        
+                        # Build pages string for display
+                        pages_str = ""
+                        if pages:
+                            pages_str = f"[PAGES: {pages}] "
+                        elif page_number:
+                            pages_str = f"[PAGES: [{page_number}]] "
                         
                         # Try to get adjacent chunks if we have chunk metadata
                         if chunk_id is not None and isinstance(chunk_id, int):
@@ -362,37 +391,42 @@ class AgentProcessor:
                                 # Get adjacent chunks using vectorstore similarity search
                                 adjacent_chunks = self._get_adjacent_chunks_content(namespace, doc_id, chunk_id)
                                 
-                                # Build the enhanced result with adjacent chunks
+                                # Build the enhanced result with adjacent chunks using DOK format
                                 chunk_set = []
                                 
                                 # Previous chunk
                                 if adjacent_chunks.get("previous"):
-                                    chunk_set.append(f"--- CHUNK {chunk_counter}a (VORHERIGER) START ---")
+                                    chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}a (VORHERIGER) START ---")
                                     chunk_set.append(adjacent_chunks["previous"])
-                                    chunk_set.append(f"--- CHUNK {chunk_counter}a (VORHERIGER) END ---")
+                                    chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}a (VORHERIGER) END ---")
                                 
-                                # Current chunk (main hit)
-                                chunk_set.append(f"--- CHUNK {chunk_counter}b (HAUPTTREFFER) START ---")
+                                # Current chunk (main hit) with page information
+                                page_info = f" SEITE {current_page}" if current_page else ""
+                                chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} START ---")
                                 chunk_set.append(content)
-                                chunk_set.append(f"--- CHUNK {chunk_counter}b (HAUPTTREFFER) END ---")
+                                chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} END ---")
                                 
                                 # Next chunk
                                 if adjacent_chunks.get("next"):
-                                    chunk_set.append(f"--- CHUNK {chunk_counter}c (NÄCHSTER) START ---")
+                                    chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}c (NÄCHSTER) START ---")
                                     chunk_set.append(adjacent_chunks["next"])
-                                    chunk_set.append(f"--- CHUNK {chunk_counter}c (NÄCHSTER) END ---")
+                                    chunk_set.append(f"--- DOK{doc_index+1} CHUNK {chunk_counter}c (NÄCHSTER) END ---")
                                 
                                 enhanced_content = "\n".join(chunk_set)
-                                results.append(f"[DOC_ID: {doc_id}] {enhanced_content}")
+                                results.append(f"[DOC_ID: {doc_id}] {pages_str} {enhanced_content}")
                                 
                                 
                             except Exception as adjacent_error:
                                 
-                                # Fallback to normal content
-                                results.append(f"[DOC_ID: {doc_id}] {content}")
+                                # Fallback to normal content with DOK format
+                                page_info = f" SEITE {current_page}" if current_page else ""
+                                formatted_content = f"--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} START ---\n{content}\n--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} END ---"
+                                results.append(f"[DOC_ID: {doc_id}] {pages_str} {formatted_content}")
                         else:
-                            # No chunk metadata, use normal content
-                            results.append(f"[DOC_ID: {doc_id}] {content}")
+                            # No chunk metadata, use normal content with DOK format
+                            page_info = f" SEITE {current_page}" if current_page else ""
+                            formatted_content = f"--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} START ---\n{content}\n--- DOK{doc_index+1} CHUNK {chunk_counter}b (HAUPTTREFFER){page_info} END ---"
+                            results.append(f"[DOC_ID: {doc_id}] {pages_str} {formatted_content}")
                         
                         chunk_counter += 1
                         
@@ -407,7 +441,10 @@ class AgentProcessor:
                 result_text = "\n\n".join(results)
                 result_text += f"\n\n[SYSTEM_INFO] FOUND_DOCUMENT_IDS: {doc_ids_list}"
                 # NEU: Seiten als SYSTEM_INFO ergänzen
-                result_text += f"\n[SYSTEM_INFO] FOUND_PAGES: {sorted(list(used_pages))}"
+                pages_sorted = sorted(list(used_pages))
+                print(f"🔍 DEBUG: used_pages set: {used_pages}")
+                print(f"🔍 DEBUG: pages_sorted: {pages_sorted}")
+                result_text += f"\n[SYSTEM_INFO] FOUND_PAGES: {pages_sorted}"
                 if target_doc_ids:
                     result_text += f"\n[SYSTEM_INFO] FILTERED_BY_DOC_IDS: {target_doc_ids}"
                 
@@ -509,7 +546,8 @@ class AgentProcessor:
                     "sources": [],
                     "confidence_score": 0.0,
                     "context_used": False,
-                    "additional_info": "Leere oder ungültige Frage"
+                    "additional_info": "Leere oder ungültige Frage",
+                    "pages": []
                 }
             
             if not namespace or not isinstance(namespace, str) or not namespace.strip():
@@ -519,7 +557,8 @@ class AgentProcessor:
                     "sources": [],
                     "confidence_score": 0.0,
                     "context_used": False,
-                    "additional_info": "Leerer oder ungültiger Namespace"
+                    "additional_info": "Leerer oder ungültiger Namespace",
+                    "pages": []
                 }
             
             researcher, _ = self.setup_agent(namespace)
@@ -582,15 +621,21 @@ TOOL-WORKFLOW (BEFOLGE DAS GENAU):
 3. WENN Ergebnisse unklar/unvollständig sind → Präzise Rückfragen stellen
 4. ERST DANN antworte basierend auf den Tool-Ergebnissen
 
+WICHTIG ZU SEITENZAHLEN:
+- Jeder Textabschnitt in den HOCHSCHULSPEZIFISCHEN INFORMATIONEN ist mit seiner Seitenzahl markiert (z.B. "SEITE 5")
+- Du MUSST die Seitenzahlen der Textabschnitte identifizieren, die du für deine Antwort verwendet hast
+- Gib nur die Seitenzahlen der Textabschnitte an, die du tatsächlich zitiert hast
+
 ANTWORTFORMAT - WICHTIG:
 Deine Antwort muss IMMER in diesem JSON-Format sein (ohne Markdown-Blöcke):
 {{
-    "answer": "Deine natürliche, freundliche Antwort hier",
+    "answer": "Deine ausführliche Antwort hier",
     "document_ids": ["extrahiere diese aus [SYSTEM_INFO] FOUND_DOCUMENT_IDS wenn du das PDF Search Tool verwendet hast"],
     "sources": ["Hier übernimmst du 1zu1 die sätze aus den Quellen die du verwendet hast, in derselben Reihenfolge wie die Dokumenten IDs, die Sätze kannst du richtig formatieren."],
     "confidence_score": 0.9,
     "context_used": {str(has_history).lower()},
-    "additional_info": "Zusätzliche Hinweise oder null"
+    "additional_info": "Zusätzliche Hinweise oder null",
+    "pages": [hier die Seitenzahlen als Liste von Zahlen der Textabschnitte, die du für deine Antwort verwendet hast, z.B. [5, 12, 15]]
 }}
 
 WICHTIG FÜR DOCUMENT_IDS:
@@ -598,6 +643,13 @@ WICHTIG FÜR DOCUMENT_IDS:
 - Wenn du das Tool nicht verwendest, lass document_ids leer: []
 - Verwende nur die echten document_ids aus den Suchergebnissen, erfinde keine!
 - Gib nur die document_ids aus, die du auch wirklich verwendet hast um die Antwort zu erstellen!
+
+WICHTIG FÜR PAGES:
+- Das Feld "pages" MUSS IMMER in deiner JSON-Antwort enthalten sein.
+- Extrahiere die Seitenzahlen aus den [PAGES: ...]-Angaben der tatsächlich verwendeten Quellen/Chunks.
+- Analysiere die Textabschnitte mit "SEITE X" Markierungen und identifiziere welche du tatsächlich für deine Antwort verwendet hast.
+- Füge jede Seite nur einmal hinzu, sortiere die Liste aufsteigend (z.B. [2,3,4]).
+- Wenn keine Seiten gefunden wurden, gib eine leere Liste zurück: []
 
 WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
 """
@@ -642,8 +694,16 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                         if match:
                             try:
                                 pages = json.loads(match.group(1))
-                            except Exception:
+                            except Exception as e:
                                 pages = []
+                        else:
+                            # Try alternative regex patterns
+                            alt_match = re.search(r'FOUND_PAGES: (\\[.*?\\])', result_str)
+                            if alt_match:
+                                try:
+                                    pages = json.loads(alt_match.group(1))
+                                except Exception as e:
+                                    pages = []
                         # Validate and structure the response with safe extraction
                         structured_response = {
                             "answer": str(parsed_response.get("answer", result_str)),
@@ -668,7 +728,8 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                         "sources": [],
                         "confidence_score": 0.7,
                         "context_used": has_history,
-                        "additional_info": "Antwort konnte nicht als strukturiertes JSON geparst werden - keine JSON-Struktur gefunden"
+                        "additional_info": "Antwort konnte nicht als strukturiertes JSON geparst werden - keine JSON-Struktur gefunden",
+                        "pages": []
                     }
                     
             except json.JSONDecodeError as json_error:
@@ -679,7 +740,8 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                     "sources": [],
                     "confidence_score": 0.7,
                     "context_used": has_history,
-                    "additional_info": f"JSON-Parsing fehlgeschlagen: {str(json_error)}"
+                    "additional_info": f"JSON-Parsing fehlgeschlagen: {str(json_error)}",
+                    "pages": []
                 }
             except Exception as parse_error:
                 return {
@@ -688,7 +750,8 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                     "sources": [],
                     "confidence_score": 0.7,
                     "context_used": has_history,
-                    "additional_info": f"Unerwarteter Parsing-Fehler: {str(parse_error)}"
+                    "additional_info": f"Unerwarteter Parsing-Fehler: {str(parse_error)}",
+                    "pages": []
                 }
             
         except Exception as e:
@@ -700,7 +763,8 @@ WICHTIG: Verwende deine Tools aktiv! Das ist der Hauptzweck deiner Existenz.
                 "sources": [],
                 "confidence_score": 0.0,
                 "context_used": False,
-                "additional_info": f"Fehler aufgetreten: {type(e).__name__}"
+                "additional_info": f"Fehler aufgetreten: {type(e).__name__}",
+                "pages": []
             }
 
     def process_document_full(self, file_content: bytes, namespace: str, fileID: str, filename: str, hasTablesOrGraphics: str = "false", special_pages: list = None) -> Dict[str, Any]:
