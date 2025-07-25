@@ -4,6 +4,9 @@ Der Server läuft auf Port `8000`.
 Siehe `.env.example` für benötigte Umgebungsvariablen.
 
 ```bash
+# Virtuelle Umgebung erstellen
+python3 -m venv venv
+
 # Virtuelle Umgebung aktivieren
 source venv/bin/activate
 
